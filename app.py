@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 import re
@@ -49,7 +50,23 @@ KIT_PATTERNS = [
     r"\b3 un\b",
 ]
 
-app = FastAPI(title="Google Shopping GTIN Analyzer", version="1.0.0")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("google-shopping-gtin")
+
+app = FastAPI(title="Google Shopping GTIN Analyzer", version="1.0.3")
+
+
+class ExternalAPIError(Exception):
+    pass
+
+
+def is_no_results_error(message: str) -> bool:
+    msg = (message or "").lower()
+    return (
+        "google hasn't returned any results for this query" in msg
+        or "hasn't returned any results" in msg
+        or "no results" in msg
+    )
 
 
 class AnalyzeRequest(BaseModel):
@@ -126,13 +143,11 @@ def parse_money(value: Any) -> Optional[float]:
         return None
 
     if "," in cleaned and "." in cleaned:
-        # decide by last separator
         if cleaned.rfind(",") > cleaned.rfind("."):
             cleaned = cleaned.replace(".", "").replace(",", ".")
         else:
             cleaned = cleaned.replace(",", "")
     elif "," in cleaned:
-        # BR style
         if cleaned.count(",") == 1:
             cleaned = cleaned.replace(".", "").replace(",", ".")
         else:
@@ -178,7 +193,7 @@ def infer_marketplace(source: Optional[str], url: Optional[str]) -> str:
         return "Magalu"
     if "americanas" in host or "americanas" in source_norm:
         return "Americanas"
-    if "casasbahia" in host or "casas bahia" in source_norm:
+    if "casasbahia" in host or "casas bahia" in host or "casasbahia" in source_norm:
         return "Casas Bahia"
     if "carrefour" in host or "carrefour" in source_norm:
         return "Carrefour"
@@ -191,25 +206,48 @@ def infer_marketplace(source: Optional[str], url: Optional[str]) -> str:
 
 
 def infer_seller(store_name: Optional[str], source: Optional[str], url: Optional[str]) -> str:
-    if store_name and store_name.strip():
-        return store_name.strip()
-    if source and source.strip():
-        return source.strip()
+    if store_name and str(store_name).strip():
+        return str(store_name).strip()
+    if source and str(source).strip():
+        return str(source).strip()
     host = host_from_url(url)
     return host or "não visível"
 
 
 def serpapi_request(params: Dict[str, Any]) -> Dict[str, Any]:
     if not SERPAPI_KEY:
-        raise RuntimeError("Defina a variável de ambiente SERPAPI_KEY.")
+        raise ExternalAPIError("SERPAPI_KEY não configurada no Render.")
+
     payload = dict(params)
     payload["api_key"] = SERPAPI_KEY
 
-    response = requests.get(SERPAPI_ENDPOINT, params=payload, headers=HEADERS, timeout=HTTP_TIMEOUT)
-    response.raise_for_status()
-    data = response.json()
-    if data.get("error"):
-        raise RuntimeError(data["error"])
+    try:
+        response = requests.get(
+            SERPAPI_ENDPOINT,
+            params=payload,
+            headers=HEADERS,
+            timeout=HTTP_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise ExternalAPIError(f"Falha de conexão com a SerpApi: {exc}") from exc
+
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+
+    if response.status_code >= 400:
+        message = None
+        if isinstance(data, dict):
+            message = data.get("error") or data.get("message")
+        raise ExternalAPIError(f"SerpApi HTTP {response.status_code}: {message or response.text[:300]}")
+
+    if isinstance(data, dict) and data.get("error"):
+        raise ExternalAPIError(f"SerpApi retornou erro: {data['error']}")
+
+    if not isinstance(data, dict):
+        raise ExternalAPIError("SerpApi retornou resposta inválida.")
+
     return data
 
 
@@ -239,6 +277,7 @@ def shopping_search(gtin: str, gl: str, hl: str, location: str) -> Dict[str, Any
         except ExternalAPIError as exc:
             last_error = str(exc)
             if is_no_results_error(last_error):
+                logger.info("Sem resultados no Google Shopping para consulta %s", query)
                 continue
             raise
 
@@ -250,7 +289,6 @@ def shopping_search(gtin: str, gl: str, hl: str, location: str) -> Dict[str, Any
 
 
 def immersive_product(page_token: str, gl: str, hl: str, location: str, next_page_token: Optional[str] = None) -> Dict[str, Any]:
-(page_token: str, gl: str, hl: str, location: str, next_page_token: Optional[str] = None) -> Dict[str, Any]:
     params: Dict[str, Any] = {
         "engine": "google_immersive_product",
         "gl": gl,
@@ -290,7 +328,7 @@ def collect_gtins_from_json(obj: Any, out: Set[str]) -> None:
 
 def fetch_page_gtins(url: str) -> Set[str]:
     found: Set[str] = set()
-    if not url:
+    if not url or url == "não visível":
         return found
 
     try:
@@ -302,7 +340,6 @@ def fetch_page_gtins(url: str) -> Set[str]:
     html = response.text or ""
     soup = BeautifulSoup(html, "html.parser")
 
-    # JSON-LD
     for script in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
         raw = (script.string or script.get_text() or "").strip()
         if not raw:
@@ -311,11 +348,9 @@ def fetch_page_gtins(url: str) -> Set[str]:
             data = json.loads(raw)
             collect_gtins_from_json(data, found)
         except Exception:
-            # tenta extrair GTIN de forma textual
             for match in re.finditer(r'"(?:gtin|gtin8|gtin12|gtin13|gtin14|ean)"\s*:\s*"(\d{8,14})"', raw, flags=re.I):
                 found.add(match.group(1))
 
-    # itemprop
     for tag in soup.select("[itemprop]"):
         itemprop = (tag.get("itemprop") or "").strip().lower()
         if itemprop in GTIN_KEYS:
@@ -324,7 +359,6 @@ def fetch_page_gtins(url: str) -> Set[str]:
             if d:
                 found.add(d)
 
-    # regex de fallback no HTML
     for match in re.finditer(r'(?:gtin|gtin8|gtin12|gtin13|gtin14|ean)[^0-9]{0,20}(\d{8,14})', html, flags=re.I):
         found.add(match.group(1))
 
@@ -377,6 +411,239 @@ def percentile(values: List[float], p: float) -> Optional[float]:
         return values[low]
     frac = rank - low
     return values[low] + (values[high] - values[low]) * frac
+
+
+def validate_store_offer(
+    ean: str,
+    store_link: Optional[str],
+    store_title: Optional[str],
+    reference_title: Optional[str],
+) -> Dict[str, Any]:
+    notes: List[str] = []
+
+    if looks_like_kit_or_combo(store_title):
+        return {
+            "status": "EXCLUÍDO - KIT/COMBO",
+            "kit_combo_detectado": True,
+            "notes": ["kit/combo detectado no título"],
+        }
+
+    gtins = fetch_page_gtins(store_link or "")
+    if gtins:
+        if ean in gtins:
+            notes.append("GTIN exato confirmado na página")
+            return {
+                "status": "EXATO",
+                "kit_combo_detectado": False,
+                "notes": notes,
+            }
+        notes.append(f"GTINs encontrados na página: {', '.join(sorted(gtins)[:5])}")
+        return {
+            "status": "DIVERGENTE",
+            "kit_combo_detectado": False,
+            "notes": notes,
+        }
+
+    sim = token_similarity(store_title, reference_title)
+    if sim >= 0.6:
+        notes.append("GTIN não visível; validação por similaridade de título")
+        return {
+            "status": "PROVÁVEL",
+            "kit_combo_detectado": False,
+            "notes": notes,
+        }
+
+    return {
+        "status": "NÃO CONFIRMADO",
+        "kit_combo_detectado": False,
+        "notes": ["GTIN não visível na página"],
+    }
+
+
+def build_rows_for_ean(ean: str, gl: str, hl: str, location: str, max_products_per_ean: int) -> List[Dict[str, Any]]:
+    search_data = shopping_search(ean, gl, hl, location)
+    shopping_results = search_data.get("shopping_results", []) or []
+    query_used = search_data.get("_query_used")
+    search_notes = search_data.get("_notes", []) or []
+
+    rows: List[Dict[str, Any]] = []
+    seen_keys: Set[str] = set()
+
+    if not shopping_results:
+        note = " | ".join(search_notes) if search_notes else "Google Shopping não retornou resultados para este GTIN/EAN."
+        return [
+            {
+                "ean": ean,
+                "seller": "não visível",
+                "marketplace": "não visível",
+                "produto_google": "não visível",
+                "produto_loja": "não visível",
+                "preco_atual": "não visível",
+                "frete": "não visível",
+                "preco_total_estimado": "não visível",
+                "preco_atual_num": None,
+                "frete_num": None,
+                "preco_total_estimado_num": None,
+                "quantidade_vendida_ou_proxy": "não visível",
+                "avaliacoes": "não visível",
+                "nota": "não visível",
+                "url_completo": "não visível",
+                "observacoes": f"SEM RESULTADOS | consulta usada: {query_used or 'nenhuma'} | {note}",
+                "alta_relevancia": "não visível",
+                "relevancia_score": 0.0,
+                "status_validacao": "SEM RESULTADOS",
+                "kit_combo_detectado": False,
+                "origem_google_posicao": None,
+            }
+        ]
+
+    for search_rank, result in enumerate(shopping_results[:max_products_per_ean], start=1):
+        candidate_title = result.get("title")
+        candidate_position = result.get("position")
+        candidate_source = result.get("source")
+        candidate_product_link = result.get("product_link")
+        candidate_multiple_sources = bool(result.get("multiple_sources"))
+        candidate_price_num = result.get("extracted_price") or parse_money(result.get("price"))
+        candidate_delivery_num = parse_money(result.get("delivery"))
+        candidate_total_num = (
+            candidate_price_num + candidate_delivery_num
+            if candidate_price_num is not None and candidate_delivery_num is not None
+            else candidate_price_num
+        )
+
+        page_token = result.get("immersive_product_page_token")
+        product_rows_created = False
+
+        if page_token:
+            next_page_token = None
+            pages_collected = 0
+            while pages_collected < 2:
+                try:
+                    product_data = immersive_product(
+                        page_token=page_token,
+                        gl=gl,
+                        hl=hl,
+                        location=location,
+                        next_page_token=next_page_token,
+                    )
+                except ExternalAPIError as exc:
+                    logger.warning("Falha no google_immersive_product para %s: %s", ean, exc)
+                    break
+
+                product_results = product_data.get("product_results", {}) or {}
+                stores = product_results.get("stores", []) or []
+
+                for store in stores:
+                    store_link = store.get("link")
+                    seller = infer_seller(store.get("name"), candidate_source, store_link)
+                    marketplace = infer_marketplace(candidate_source, store_link)
+                    price_num = store.get("extracted_price") or parse_money(store.get("price"))
+                    shipping_num = store.get("shipping_extracted")
+                    if shipping_num is None:
+                        shipping_num = parse_money(store.get("shipping"))
+                    total_num = store.get("extracted_total")
+                    if total_num is None:
+                        if price_num is not None and shipping_num is not None:
+                            total_num = price_num + shipping_num
+                        else:
+                            total_num = price_num
+
+                    validation = validate_store_offer(
+                        ean=ean,
+                        store_link=store_link,
+                        store_title=store.get("title") or candidate_title,
+                        reference_title=product_results.get("title") or candidate_title,
+                    )
+
+                    reviews = store.get("reviews")
+                    rating = store.get("rating")
+                    score = relevance_score(candidate_position, reviews, rating, candidate_multiple_sources)
+
+                    notes = list(validation["notes"])
+                    if query_used:
+                        notes.append(f"consulta usada: {query_used}")
+
+                    row = {
+                        "ean": ean,
+                        "seller": seller,
+                        "marketplace": marketplace,
+                        "produto_google": candidate_title or "não visível",
+                        "produto_loja": store.get("title") or candidate_title or "não visível",
+                        "preco_atual": money_br(price_num),
+                        "frete": money_br(shipping_num),
+                        "preco_total_estimado": money_br(total_num),
+                        "preco_atual_num": price_num,
+                        "frete_num": shipping_num,
+                        "preco_total_estimado_num": total_num,
+                        "quantidade_vendida_ou_proxy": build_proxy(candidate_position, reviews, rating, candidate_multiple_sources),
+                        "avaliacoes": reviews if reviews is not None else "não visível",
+                        "nota": rating if rating is not None else "não visível",
+                        "url_completo": store_link or candidate_product_link or "não visível",
+                        "observacoes": " | ".join(notes) or "sem observações",
+                        "alta_relevancia": relevance_label(score, reviews, candidate_position),
+                        "relevancia_score": score,
+                        "status_validacao": validation["status"],
+                        "kit_combo_detectado": validation["kit_combo_detectado"],
+                        "origem_google_posicao": candidate_position if candidate_position is not None else search_rank,
+                    }
+
+                    dedupe_key = f"{ean}|{row['url_completo']}|{row['seller']}|{row['marketplace']}"
+                    if dedupe_key not in seen_keys:
+                        seen_keys.add(dedupe_key)
+                        rows.append(row)
+                        product_rows_created = True
+
+                next_page_token = product_results.get("stores_next_page_token")
+                pages_collected += 1
+                if not next_page_token:
+                    break
+
+        if not product_rows_created:
+            seller = infer_seller(None, candidate_source, candidate_product_link)
+            marketplace = infer_marketplace(candidate_source, candidate_product_link)
+            status = "NÃO CONFIRMADO"
+            notes = ["sem detalhamento de stores; mantido como resultado de pesquisa"]
+            if query_used:
+                notes.append(f"consulta usada: {query_used}")
+            if looks_like_kit_or_combo(candidate_title):
+                status = "EXCLUÍDO - KIT/COMBO"
+                notes = ["kit/combo detectado no título"]
+                if query_used:
+                    notes.append(f"consulta usada: {query_used}")
+
+            reviews = result.get("reviews")
+            rating = result.get("rating")
+            score = relevance_score(candidate_position, reviews, rating, candidate_multiple_sources)
+            row = {
+                "ean": ean,
+                "seller": seller,
+                "marketplace": marketplace,
+                "produto_google": candidate_title or "não visível",
+                "produto_loja": candidate_title or "não visível",
+                "preco_atual": money_br(candidate_price_num),
+                "frete": result.get("delivery") or "não visível",
+                "preco_total_estimado": money_br(candidate_total_num),
+                "preco_atual_num": candidate_price_num,
+                "frete_num": candidate_delivery_num,
+                "preco_total_estimado_num": candidate_total_num,
+                "quantidade_vendida_ou_proxy": build_proxy(candidate_position, reviews, rating, candidate_multiple_sources),
+                "avaliacoes": reviews if reviews is not None else "não visível",
+                "nota": rating if rating is not None else "não visível",
+                "url_completo": candidate_product_link or "não visível",
+                "observacoes": " | ".join(notes),
+                "alta_relevancia": relevance_label(score, reviews, candidate_position),
+                "relevancia_score": score,
+                "status_validacao": status,
+                "kit_combo_detectado": status == "EXCLUÍDO - KIT/COMBO",
+                "origem_google_posicao": candidate_position if candidate_position is not None else search_rank,
+            }
+
+            dedupe_key = f"{ean}|{row['url_completo']}|{row['seller']}|{row['marketplace']}"
+            if dedupe_key not in seen_keys:
+                seen_keys.add(dedupe_key)
+                rows.append(row)
+
+    return rows
 
 
 def summarize_ean(ean: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -463,198 +730,6 @@ def summarize_ean(ean: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def validate_store_offer(
-    ean: str,
-    store_link: Optional[str],
-    store_title: Optional[str],
-    reference_title: Optional[str],
-) -> Dict[str, Any]:
-    notes: List[str] = []
-
-    if looks_like_kit_or_combo(store_title):
-        return {
-            "status": "EXCLUÍDO - KIT/COMBO",
-            "kit_combo_detectado": True,
-            "notes": ["kit/combo detectado no título"],
-        }
-
-    gtins = fetch_page_gtins(store_link or "")
-    if gtins:
-        if ean in gtins:
-            notes.append("GTIN exato confirmado na página")
-            return {
-                "status": "EXATO",
-                "kit_combo_detectado": False,
-                "notes": notes,
-            }
-        notes.append(f"GTINs encontrados na página: {', '.join(sorted(gtins)[:5])}")
-        return {
-            "status": "DIVERGENTE",
-            "kit_combo_detectado": False,
-            "notes": notes,
-        }
-
-    sim = token_similarity(store_title, reference_title)
-    if sim >= 0.6:
-        notes.append("GTIN não visível; validação por similaridade de título")
-        return {
-            "status": "PROVÁVEL",
-            "kit_combo_detectado": False,
-            "notes": notes,
-        }
-
-    return {
-        "status": "NÃO CONFIRMADO",
-        "kit_combo_detectado": False,
-        "notes": ["GTIN não visível na página"],
-    }
-
-
-def build_rows_for_ean(ean: str, gl: str, hl: str, location: str, max_products_per_ean: int) -> List[Dict[str, Any]]:
-    search_data = shopping_search(ean, gl, hl, location)
-    shopping_results = search_data.get("shopping_results", []) or []
-
-    rows: List[Dict[str, Any]] = []
-    seen_keys: Set[str] = set()
-
-    for search_rank, result in enumerate(shopping_results[:max_products_per_ean], start=1):
-        candidate_title = result.get("title")
-        candidate_position = result.get("position")
-        candidate_source = result.get("source")
-        candidate_product_link = result.get("product_link")
-        candidate_multiple_sources = bool(result.get("multiple_sources"))
-        candidate_price_num = result.get("extracted_price") or parse_money(result.get("price"))
-        candidate_delivery_num = parse_money(result.get("delivery"))
-        candidate_total_num = (
-            candidate_price_num + candidate_delivery_num
-            if candidate_price_num is not None and candidate_delivery_num is not None
-            else candidate_price_num
-        )
-
-        page_token = result.get("immersive_product_page_token")
-        product_rows_created = False
-
-        # busca ofertas detalhadas por loja
-        if page_token:
-            next_page_token = None
-            pages_collected = 0
-            while pages_collected < 2:
-                product_data = immersive_product(
-                    page_token=page_token,
-                    gl=gl,
-                    hl=hl,
-                    location=location,
-                    next_page_token=next_page_token,
-                )
-                product_results = product_data.get("product_results", {}) or {}
-                stores = product_results.get("stores", []) or []
-
-                for store in stores:
-                    store_link = store.get("link")
-                    seller = infer_seller(store.get("name"), candidate_source, store_link)
-                    marketplace = infer_marketplace(candidate_source, store_link)
-                    price_num = store.get("extracted_price") or parse_money(store.get("price"))
-                    shipping_num = store.get("shipping_extracted")
-                    if shipping_num is None:
-                        shipping_num = parse_money(store.get("shipping"))
-                    total_num = store.get("extracted_total")
-                    if total_num is None:
-                        if price_num is not None and shipping_num is not None:
-                            total_num = price_num + shipping_num
-                        else:
-                            total_num = price_num
-
-                    validation = validate_store_offer(
-                        ean=ean,
-                        store_link=store_link,
-                        store_title=store.get("title") or candidate_title,
-                        reference_title=product_results.get("title") or candidate_title,
-                    )
-
-                    reviews = store.get("reviews")
-                    rating = store.get("rating")
-                    score = relevance_score(candidate_position, reviews, rating, candidate_multiple_sources)
-
-                    row = {
-                        "ean": ean,
-                        "seller": seller,
-                        "marketplace": marketplace,
-                        "produto_google": candidate_title or "não visível",
-                        "produto_loja": store.get("title") or candidate_title or "não visível",
-                        "preco_atual": money_br(price_num),
-                        "frete": money_br(shipping_num),
-                        "preco_total_estimado": money_br(total_num),
-                        "preco_atual_num": price_num,
-                        "frete_num": shipping_num,
-                        "preco_total_estimado_num": total_num,
-                        "quantidade_vendida_ou_proxy": build_proxy(candidate_position, reviews, rating, candidate_multiple_sources),
-                        "avaliacoes": reviews if reviews is not None else "não visível",
-                        "nota": rating if rating is not None else "não visível",
-                        "url_completo": store_link or candidate_product_link or "não visível",
-                        "observacoes": " | ".join(validation["notes"]) or "sem observações",
-                        "alta_relevancia": relevance_label(score, reviews, candidate_position),
-                        "relevancia_score": score,
-                        "status_validacao": validation["status"],
-                        "kit_combo_detectado": validation["kit_combo_detectado"],
-                        "origem_google_posicao": candidate_position if candidate_position is not None else search_rank,
-                    }
-
-                    dedupe_key = f"{ean}|{row['url_completo']}|{row['seller']}|{row['marketplace']}"
-                    if dedupe_key not in seen_keys:
-                        seen_keys.add(dedupe_key)
-                        rows.append(row)
-                        product_rows_created = True
-
-                next_page_token = product_results.get("stores_next_page_token")
-                pages_collected += 1
-                if not next_page_token:
-                    break
-
-        # fallback quando não vier detalhamento de stores
-        if not product_rows_created:
-            seller = infer_seller(None, candidate_source, candidate_product_link)
-            marketplace = infer_marketplace(candidate_source, candidate_product_link)
-            status = "NÃO CONFIRMADO"
-            notes = ["sem detalhamento de stores; mantido como resultado de pesquisa"]
-            if looks_like_kit_or_combo(candidate_title):
-                status = "EXCLUÍDO - KIT/COMBO"
-                notes = ["kit/combo detectado no título"]
-
-            reviews = result.get("reviews")
-            rating = result.get("rating")
-            score = relevance_score(candidate_position, reviews, rating, candidate_multiple_sources)
-            row = {
-                "ean": ean,
-                "seller": seller,
-                "marketplace": marketplace,
-                "produto_google": candidate_title or "não visível",
-                "produto_loja": candidate_title or "não visível",
-                "preco_atual": money_br(candidate_price_num),
-                "frete": result.get("delivery") or "não visível",
-                "preco_total_estimado": money_br(candidate_total_num),
-                "preco_atual_num": candidate_price_num,
-                "frete_num": candidate_delivery_num,
-                "preco_total_estimado_num": candidate_total_num,
-                "quantidade_vendida_ou_proxy": build_proxy(candidate_position, reviews, rating, candidate_multiple_sources),
-                "avaliacoes": reviews if reviews is not None else "não visível",
-                "nota": rating if rating is not None else "não visível",
-                "url_completo": candidate_product_link or "não visível",
-                "observacoes": " | ".join(notes),
-                "alta_relevancia": relevance_label(score, reviews, candidate_position),
-                "relevancia_score": score,
-                "status_validacao": status,
-                "kit_combo_detectado": status == "EXCLUÍDO - KIT/COMBO",
-                "origem_google_posicao": candidate_position if candidate_position is not None else search_rank,
-            }
-
-            dedupe_key = f"{ean}|{row['url_completo']}|{row['seller']}|{row['marketplace']}"
-            if dedupe_key not in seen_keys:
-                seen_keys.add(dedupe_key)
-                rows.append(row)
-
-    return rows
-
-
 def build_ml_top10(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     by_ean: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
@@ -709,31 +784,39 @@ def analyze(payload: AnalyzeRequest, x_app_token: Optional[str] = Header(default
     if APP_TOKEN and x_app_token != APP_TOKEN:
         raise HTTPException(status_code=401, detail="Token inválido.")
 
-    all_rows: List[Dict[str, Any]] = []
-    summaries: List[Dict[str, Any]] = []
+    try:
+        all_rows: List[Dict[str, Any]] = []
+        summaries: List[Dict[str, Any]] = []
 
-    for ean in payload.eans:
-        rows = build_rows_for_ean(
-            ean=ean,
-            gl=payload.gl,
-            hl=payload.hl,
-            location=payload.location,
-            max_products_per_ean=payload.max_products_per_ean,
-        )
-        all_rows.extend(rows)
-        summaries.append(summarize_ean(ean, rows))
+        for ean in payload.eans:
+            rows = build_rows_for_ean(
+                ean=ean,
+                gl=payload.gl,
+                hl=payload.hl,
+                location=payload.location,
+                max_products_per_ean=payload.max_products_per_ean,
+            )
+            all_rows.extend(rows)
+            summaries.append(summarize_ean(ean, rows))
 
-    ml_top10 = build_ml_top10(all_rows)
+        ml_top10 = build_ml_top10(all_rows)
 
-    return {
-        "meta": {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "location": payload.location,
-            "gl": payload.gl,
-            "hl": payload.hl,
-            "max_products_per_ean": payload.max_products_per_ean,
-        },
-        "summary": summaries,
-        "results": all_rows,
-        "mercado_livre_top10": ml_top10,
-    }
+        return {
+            "meta": {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "location": payload.location,
+                "gl": payload.gl,
+                "hl": payload.hl,
+                "max_products_per_ean": payload.max_products_per_ean,
+            },
+            "summary": summaries,
+            "results": all_rows,
+            "mercado_livre_top10": ml_top10,
+        }
+    except ExternalAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Erro interno no /analyze")
+        raise HTTPException(status_code=500, detail=f"Erro interno no worker: {exc}") from exc
