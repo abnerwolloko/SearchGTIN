@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException
+import logging
 from pydantic import BaseModel, Field, field_validator
 
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
@@ -49,7 +50,13 @@ KIT_PATTERNS = [
     r"\b3 un\b",
 ]
 
-app = FastAPI(title="Google Shopping GTIN Analyzer", version="1.0.0")
+logger = logging.getLogger("uvicorn.error")
+
+app = FastAPI(title="Google Shopping GTIN Analyzer", version="1.0.1")
+
+
+class ExternalAPIError(Exception):
+    pass
 
 
 class AnalyzeRequest(BaseModel):
@@ -201,15 +208,37 @@ def infer_seller(store_name: Optional[str], source: Optional[str], url: Optional
 
 def serpapi_request(params: Dict[str, Any]) -> Dict[str, Any]:
     if not SERPAPI_KEY:
-        raise RuntimeError("Defina a variável de ambiente SERPAPI_KEY.")
+        raise ExternalAPIError("SERPAPI_KEY não configurada no Render.")
+
     payload = dict(params)
     payload["api_key"] = SERPAPI_KEY
 
-    response = requests.get(SERPAPI_ENDPOINT, params=payload, headers=HEADERS, timeout=HTTP_TIMEOUT)
-    response.raise_for_status()
-    data = response.json()
+    try:
+        response = requests.get(SERPAPI_ENDPOINT, params=payload, headers=HEADERS, timeout=HTTP_TIMEOUT)
+    except requests.RequestException as exc:
+        raise ExternalAPIError(f"Falha de conexão com a SerpApi: {exc}") from exc
+
+    body_preview = response.text[:500] if response.text else ""
+
+    if response.status_code >= 400:
+        try:
+            error_data = response.json()
+            message = error_data.get("error") or error_data.get("message") or body_preview
+        except Exception:
+            message = body_preview or f"HTTP {response.status_code}"
+        raise ExternalAPIError(f"SerpApi HTTP {response.status_code}: {message}")
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise ExternalAPIError(f"Resposta inválida da SerpApi: {body_preview}") from exc
+
+    status = ((data.get("search_metadata") or {}).get("status") or "").lower()
     if data.get("error"):
-        raise RuntimeError(data["error"])
+        raise ExternalAPIError(f"SerpApi retornou erro: {data['error']}")
+    if status == "error":
+        raise ExternalAPIError(f"SerpApi search_metadata.status=Error: {body_preview}")
+
     return data
 
 
@@ -505,13 +534,18 @@ def build_rows_for_ean(ean: str, gl: str, hl: str, location: str, max_products_p
             next_page_token = None
             pages_collected = 0
             while pages_collected < 2:
-                product_data = immersive_product(
-                    page_token=page_token,
-                    gl=gl,
-                    hl=hl,
-                    location=location,
-                    next_page_token=next_page_token,
-                )
+                try:
+                    product_data = immersive_product(
+                        page_token=page_token,
+                        gl=gl,
+                        hl=hl,
+                        location=location,
+                        next_page_token=next_page_token,
+                    )
+                except ExternalAPIError as exc:
+                    logger.warning("Falha no immersive_product para %s: %s", ean, exc)
+                    break
+
                 product_results = product_data.get("product_results", {}) or {}
                 stores = product_results.get("stores", []) or []
 
@@ -678,28 +712,35 @@ def analyze(payload: AnalyzeRequest, x_app_token: Optional[str] = Header(default
     all_rows: List[Dict[str, Any]] = []
     summaries: List[Dict[str, Any]] = []
 
-    for ean in payload.eans:
-        rows = build_rows_for_ean(
-            ean=ean,
-            gl=payload.gl,
-            hl=payload.hl,
-            location=payload.location,
-            max_products_per_ean=payload.max_products_per_ean,
-        )
-        all_rows.extend(rows)
-        summaries.append(summarize_ean(ean, rows))
+    try:
+        for ean in payload.eans:
+            rows = build_rows_for_ean(
+                ean=ean,
+                gl=payload.gl,
+                hl=payload.hl,
+                location=payload.location,
+                max_products_per_ean=payload.max_products_per_ean,
+            )
+            all_rows.extend(rows)
+            summaries.append(summarize_ean(ean, rows))
 
-    ml_top10 = build_ml_top10(all_rows)
+        ml_top10 = build_ml_top10(all_rows)
 
-    return {
-        "meta": {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "location": payload.location,
-            "gl": payload.gl,
-            "hl": payload.hl,
-            "max_products_per_ean": payload.max_products_per_ean,
-        },
-        "summary": summaries,
-        "results": all_rows,
-        "mercado_livre_top10": ml_top10,
-    }
+        return {
+            "meta": {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "location": payload.location,
+                "gl": payload.gl,
+                "hl": payload.hl,
+                "max_products_per_ean": payload.max_products_per_ean,
+            },
+            "summary": summaries,
+            "results": all_rows,
+            "mercado_livre_top10": ml_top10,
+        }
+    except ExternalAPIError as exc:
+        logger.exception("Erro externo no /analyze: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Erro interno no /analyze")
+        raise HTTPException(status_code=500, detail=f"Erro interno no worker: {exc}")
