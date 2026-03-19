@@ -11,7 +11,6 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException
-import logging
 from pydantic import BaseModel, Field, field_validator
 
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
@@ -50,13 +49,7 @@ KIT_PATTERNS = [
     r"\b3 un\b",
 ]
 
-logger = logging.getLogger("uvicorn.error")
-
-app = FastAPI(title="Google Shopping GTIN Analyzer", version="1.0.1")
-
-
-class ExternalAPIError(Exception):
-    pass
+app = FastAPI(title="Google Shopping GTIN Analyzer", version="1.0.0")
 
 
 class AnalyzeRequest(BaseModel):
@@ -208,54 +201,56 @@ def infer_seller(store_name: Optional[str], source: Optional[str], url: Optional
 
 def serpapi_request(params: Dict[str, Any]) -> Dict[str, Any]:
     if not SERPAPI_KEY:
-        raise ExternalAPIError("SERPAPI_KEY não configurada no Render.")
-
+        raise RuntimeError("Defina a variável de ambiente SERPAPI_KEY.")
     payload = dict(params)
     payload["api_key"] = SERPAPI_KEY
 
-    try:
-        response = requests.get(SERPAPI_ENDPOINT, params=payload, headers=HEADERS, timeout=HTTP_TIMEOUT)
-    except requests.RequestException as exc:
-        raise ExternalAPIError(f"Falha de conexão com a SerpApi: {exc}") from exc
-
-    body_preview = response.text[:500] if response.text else ""
-
-    if response.status_code >= 400:
-        try:
-            error_data = response.json()
-            message = error_data.get("error") or error_data.get("message") or body_preview
-        except Exception:
-            message = body_preview or f"HTTP {response.status_code}"
-        raise ExternalAPIError(f"SerpApi HTTP {response.status_code}: {message}")
-
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise ExternalAPIError(f"Resposta inválida da SerpApi: {body_preview}") from exc
-
-    status = ((data.get("search_metadata") or {}).get("status") or "").lower()
+    response = requests.get(SERPAPI_ENDPOINT, params=payload, headers=HEADERS, timeout=HTTP_TIMEOUT)
+    response.raise_for_status()
+    data = response.json()
     if data.get("error"):
-        raise ExternalAPIError(f"SerpApi retornou erro: {data['error']}")
-    if status == "error":
-        raise ExternalAPIError(f"SerpApi search_metadata.status=Error: {body_preview}")
-
+        raise RuntimeError(data["error"])
     return data
 
 
 def shopping_search(gtin: str, gl: str, hl: str, location: str) -> Dict[str, Any]:
-    return serpapi_request(
-        {
-            "engine": "google_shopping",
-            "q": gtin,
-            "gl": gl,
-            "hl": hl,
-            "location": location,
-            "no_cache": "true",
-        }
-    )
+    tried_queries = [
+        gtin,
+        f'"{gtin}"',
+        f"gtin {gtin}",
+        f"ean {gtin}",
+    ]
+
+    last_error: Optional[str] = None
+    for query in tried_queries:
+        try:
+            data = serpapi_request(
+                {
+                    "engine": "google_shopping",
+                    "q": query,
+                    "gl": gl,
+                    "hl": hl,
+                    "location": location,
+                    "no_cache": "true",
+                }
+            )
+            data["_query_used"] = query
+            return data
+        except ExternalAPIError as exc:
+            last_error = str(exc)
+            if is_no_results_error(last_error):
+                continue
+            raise
+
+    return {
+        "shopping_results": [],
+        "_query_used": None,
+        "_notes": [last_error or "Google Shopping não retornou resultados para este GTIN/EAN."],
+    }
 
 
 def immersive_product(page_token: str, gl: str, hl: str, location: str, next_page_token: Optional[str] = None) -> Dict[str, Any]:
+(page_token: str, gl: str, hl: str, location: str, next_page_token: Optional[str] = None) -> Dict[str, Any]:
     params: Dict[str, Any] = {
         "engine": "google_immersive_product",
         "gl": gl,
@@ -428,20 +423,30 @@ def summarize_ean(ean: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     leader_name = leader["seller"] if leader else "não visível"
     leader_mkt = leader["marketplace"] if leader else "não visível"
 
-    resumo = (
-        f"Foram encontrados {len(eligible)} anúncios confirmados/prováveis para o GTIN {ean}. "
-        f"O seller mais forte por proxy de relevância é {leader_name} em {leader_mkt}. "
-        f"O menor preço total estimado é {money_br(min_total)}, o maior é {money_br(max_total)} "
-        f"e o preço médio é {money_br(avg_total)}. "
-        f"Foram encontrados {len(ml_rows)} anúncios elegíveis de Mercado Livre."
-    )
+    if not eligible:
+        resumo = (
+            f"Não foram encontrados anúncios confirmados/prováveis para o GTIN {ean} no Google Shopping com a localização configurada. "
+            f"Os identificadores GTIN ajudam o Google a classificar produtos, mas a busca ainda depende do que está indexado e disponível na Shopping tab."
+        )
+        conclusao = (
+            "Sem base competitiva suficiente para sugerir faixa de preço ideal. "
+            "Tente nova coleta com outra localização, confira se o GTIN está correto e valide se o produto está indexado no Google Shopping."
+        )
+    else:
+        resumo = (
+            f"Foram encontrados {len(eligible)} anúncios confirmados/prováveis para o GTIN {ean}. "
+            f"O seller mais forte por proxy de relevância é {leader_name} em {leader_mkt}. "
+            f"O menor preço total estimado é {money_br(min_total)}, o maior é {money_br(max_total)} "
+            f"e o preço médio é {money_br(avg_total)}. "
+            f"Foram encontrados {len(ml_rows)} anúncios elegíveis de Mercado Livre."
+        )
 
-    conclusao = (
-        f"Faixa de preço ideal sugerida: {faixa_ideal}. "
-        f"Seller mais forte: {leader_name} ({leader_mkt}). "
-        f"Menor preço observado: {cheapest['preco_total_estimado'] if cheapest else 'não visível'}. "
-        f"Maior preço observado: {priciest['preco_total_estimado'] if priciest else 'não visível'}."
-    )
+        conclusao = (
+            f"Faixa de preço ideal sugerida: {faixa_ideal}. "
+            f"Seller mais forte: {leader_name} ({leader_mkt}). "
+            f"Menor preço observado: {cheapest['preco_total_estimado'] if cheapest else 'não visível'}. "
+            f"Maior preço observado: {priciest['preco_total_estimado'] if priciest else 'não visível'}."
+        )
 
     return {
         "ean": ean,
@@ -534,18 +539,13 @@ def build_rows_for_ean(ean: str, gl: str, hl: str, location: str, max_products_p
             next_page_token = None
             pages_collected = 0
             while pages_collected < 2:
-                try:
-                    product_data = immersive_product(
-                        page_token=page_token,
-                        gl=gl,
-                        hl=hl,
-                        location=location,
-                        next_page_token=next_page_token,
-                    )
-                except ExternalAPIError as exc:
-                    logger.warning("Falha no immersive_product para %s: %s", ean, exc)
-                    break
-
+                product_data = immersive_product(
+                    page_token=page_token,
+                    gl=gl,
+                    hl=hl,
+                    location=location,
+                    next_page_token=next_page_token,
+                )
                 product_results = product_data.get("product_results", {}) or {}
                 stores = product_results.get("stores", []) or []
 
@@ -712,35 +712,28 @@ def analyze(payload: AnalyzeRequest, x_app_token: Optional[str] = Header(default
     all_rows: List[Dict[str, Any]] = []
     summaries: List[Dict[str, Any]] = []
 
-    try:
-        for ean in payload.eans:
-            rows = build_rows_for_ean(
-                ean=ean,
-                gl=payload.gl,
-                hl=payload.hl,
-                location=payload.location,
-                max_products_per_ean=payload.max_products_per_ean,
-            )
-            all_rows.extend(rows)
-            summaries.append(summarize_ean(ean, rows))
+    for ean in payload.eans:
+        rows = build_rows_for_ean(
+            ean=ean,
+            gl=payload.gl,
+            hl=payload.hl,
+            location=payload.location,
+            max_products_per_ean=payload.max_products_per_ean,
+        )
+        all_rows.extend(rows)
+        summaries.append(summarize_ean(ean, rows))
 
-        ml_top10 = build_ml_top10(all_rows)
+    ml_top10 = build_ml_top10(all_rows)
 
-        return {
-            "meta": {
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-                "location": payload.location,
-                "gl": payload.gl,
-                "hl": payload.hl,
-                "max_products_per_ean": payload.max_products_per_ean,
-            },
-            "summary": summaries,
-            "results": all_rows,
-            "mercado_livre_top10": ml_top10,
-        }
-    except ExternalAPIError as exc:
-        logger.exception("Erro externo no /analyze: %s", exc)
-        raise HTTPException(status_code=502, detail=str(exc))
-    except Exception as exc:
-        logger.exception("Erro interno no /analyze")
-        raise HTTPException(status_code=500, detail=f"Erro interno no worker: {exc}")
+    return {
+        "meta": {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "location": payload.location,
+            "gl": payload.gl,
+            "hl": payload.hl,
+            "max_products_per_ean": payload.max_products_per_ean,
+        },
+        "summary": summaries,
+        "results": all_rows,
+        "mercado_livre_top10": ml_top10,
+    }
