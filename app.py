@@ -1,4 +1,3 @@
-
 import json
 import logging
 import math
@@ -6,9 +5,10 @@ import os
 import re
 import statistics
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -18,12 +18,12 @@ from pydantic import BaseModel, Field, field_validator
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "").strip()
 APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "35"))
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/146.0.0.0 Safari/537.36"
+    "Chrome/124.0.0.0 Safari/537.36"
 )
 
 HEADERS = {
@@ -39,11 +39,11 @@ KIT_PATTERNS = [
 ]
 STOPWORDS = {
     "de", "da", "do", "das", "dos", "para", "com", "sem", "e", "a", "o", "as", "os",
-    "um", "uma", "the", "with", "by", "in", "on", "new", "novo", "nova"
+    "um", "uma", "the", "with", "by", "in", "on", "new", "novo", "nova",
 }
 
 logger = logging.getLogger("uvicorn.error")
-app = FastAPI(title="Google Shopping GTIN Analyzer", version="3.0.0")
+app = FastAPI(title="Google Shopping GTIN Analyzer", version="4.0.0")
 
 
 class ExternalAPIError(Exception):
@@ -67,7 +67,7 @@ class EntryInput(BaseModel):
     def validate_base_url(cls, value: str) -> str:
         value = (value or "").strip()
         if not value.lower().startswith(("http://", "https://")):
-            raise ValueError("A URL precisa começar com http:// ou https://")
+            raise ValueError("A URL precisa comecar com http:// ou https://")
         return value
 
 
@@ -84,8 +84,8 @@ class AnalyzeRequest(BaseModel):
         if not values:
             raise ValueError("Informe pelo menos 1 entrada.")
         if len(values) > 10:
-            raise ValueError("Máximo de 10 entradas por execução.")
-        seen = set()
+            raise ValueError("Maximo de 10 entradas por execucao.")
+        seen: set = set()
         unique = []
         for item in values:
             key = (item.ean, item.base_url)
@@ -95,7 +95,7 @@ class AnalyzeRequest(BaseModel):
         return unique
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def digits_only(value: str) -> str:
     return re.sub(r"\D+", "", value or "")
@@ -159,9 +159,9 @@ def parse_money(value: Any) -> Optional[float]:
 
 def money_br(value: Optional[float]) -> str:
     if value is None:
-        return "não visível"
+        return "nao visivel"
     if value == 0.0:
-        return "Grátis"
+        return "Gratis"
     s = f"{value:,.2f}"
     s = s.replace(",", "X").replace(".", ",").replace("X", ".")
     return f"R$ {s}"
@@ -193,20 +193,34 @@ def marketplace_from_url(url: Optional[str], source: Optional[str] = None) -> st
         return "Casas Bahia"
     if "carrefour" in host or "carrefour" in source_norm:
         return "Carrefour"
-    return source or host or "não visível"
+    if "submarino" in host or "submarino" in source_norm:
+        return "Submarino"
+    if "extra.com" in host or "extra" in source_norm:
+        return "Extra"
+    if "kabum" in host or "kabum" in source_norm:
+        return "KaBuM"
+    if source and str(source).strip():
+        return str(source).strip()
+    return host or "nao visivel"
+
+
+def infer_seller(store_name: Optional[str], source: Optional[str], url: Optional[str]) -> str:
+    """Retorna o nome do vendedor/loja da forma mais legível possível."""
+    if store_name and str(store_name).strip():
+        return str(store_name).strip()
+    # source da SerpApi costuma ser o nome da loja como aparece no Google Shopping
+    if source and str(source).strip():
+        return str(source).strip()
+    # ultimo recurso: dominio limpo
+    host = host_from_url(url)
+    if host:
+        name = re.sub(r"^www\.", "", host)
+        name = re.sub(r"\.(com\.br|com|br|net|org)$", "", name)
+        return name.capitalize() if name else "nao visivel"
+    return "nao visivel"
 
 
 # ── Fetchers ──────────────────────────────────────────────────────────────────
-
-def requests_get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    try:
-        response = requests.get(url, params=params, headers=HEADERS, timeout=HTTP_TIMEOUT)
-        response.raise_for_status()
-        return response.json()
-    except Exception as exc:
-        logger.warning("Falha ao obter JSON %s: %s", url, exc)
-        return None
-
 
 def requests_get_text(url: str) -> Optional[str]:
     try:
@@ -252,7 +266,9 @@ def extract_gtins_from_html(html: str) -> Set[str]:
             data = json.loads(raw)
             collect_gtins_from_json(data, found)
         except Exception:
-            for match in re.finditer(r'"(?:gtin|gtin8|gtin12|gtin13|gtin14|ean)"\s*:\s*"(\d{8,14})"', raw, flags=re.I):
+            for match in re.finditer(
+                r'"(?:gtin|gtin8|gtin12|gtin13|gtin14|ean)"\s*:\s*"(\d{8,14})"', raw, flags=re.I
+            ):
                 found.add(match.group(1))
     for tag in soup.select("[itemprop]"):
         itemprop = (tag.get("itemprop") or "").strip().lower()
@@ -261,12 +277,14 @@ def extract_gtins_from_html(html: str) -> Set[str]:
             d = digits_only(value)
             if d:
                 found.add(d)
-    for match in re.finditer(r'(?:gtin|gtin8|gtin12|gtin13|gtin14|ean)[^0-9]{0,25}(\d{8,14})', html, flags=re.I):
+    for match in re.finditer(
+        r'(?:gtin|gtin8|gtin12|gtin13|gtin14|ean)[^0-9]{0,25}(\d{8,14})', html, flags=re.I
+    ):
         found.add(match.group(1))
     return found
 
 
-# ── Base reference (sem API Mercado Livre) ────────────────────────────────────
+# ── Base reference ────────────────────────────────────────────────────────────
 
 def fetch_base_reference(entry: EntryInput) -> Dict[str, Any]:
     ean = entry.ean
@@ -279,7 +297,6 @@ def fetch_base_reference(entry: EntryInput) -> Dict[str, Any]:
     title = None
     if html:
         soup = BeautifulSoup(html, "html.parser")
-        # Tenta og:title primeiro, depois title normal
         og = soup.find("meta", property="og:title")
         if og and og.get("content"):
             title = og["content"].strip()
@@ -290,22 +307,22 @@ def fetch_base_reference(entry: EntryInput) -> Dict[str, Any]:
 
     if gtins_found:
         if ean in gtins_found:
-            notes.append("GTIN/EAN confirmado na URL de referência")
+            notes.append("GTIN/EAN confirmado na URL de referencia")
             base_status = "BASE CONFIRMADA"
         else:
-            notes.append(f"GTIN/EAN divergente na URL de referência: encontrados {', '.join(gtins_found[:5])}")
-            base_status = "BASE COM DIVERGÊNCIA"
+            notes.append(f"GTIN/EAN divergente: encontrados {', '.join(gtins_found[:5])}")
+            base_status = "BASE COM DIVERGENCIA"
     else:
-        notes.append("GTIN/EAN não visível na URL de referência")
-        base_status = "BASE SEM GTIN VISÍVEL"
+        notes.append("GTIN/EAN nao visivel na URL de referencia")
+        base_status = "BASE SEM GTIN VISIVEL"
 
     if looks_like_kit_or_combo(title):
-        notes.append("URL de referência parece kit/combo; atenção na validação")
+        notes.append("URL de referencia parece kit/combo")
 
     return {
         "ean_input": ean,
         "base_url": url,
-        "base_title": title or "não visível",
+        "base_title": title or "nao visivel",
         "base_status": base_status,
         "base_notes": " | ".join(notes),
         "_gtins_set": set(gtins_found),
@@ -317,39 +334,51 @@ def fetch_base_reference(entry: EntryInput) -> Dict[str, Any]:
 def validate_offer(ref: Dict[str, Any], title: Optional[str], url: Optional[str]) -> Dict[str, Any]:
     notes: List[str] = []
     if looks_like_kit_or_combo(title):
-        return {"status": "EXCLUÍDO - KIT/COMBO", "kit_combo_detectado": True, "notes": ["kit/combo detectado no título"], "combined_score": 0.0}
+        return {
+            "status": "EXCLUIDO - KIT/COMBO",
+            "kit_combo_detectado": True,
+            "notes": ["kit/combo detectado no titulo"],
+            "combined_score": 0.0,
+        }
 
     gtins: Set[str] = set()
-    if url and url != "não visível":
+    if url and url != "nao visivel":
         html = requests_get_text(url)
         if html:
             gtins = extract_gtins_from_html(html)
-
-    ref_gtins = set(ref.get("_gtins_set") or [])
-    if ref["ean_input"]:
-        ref_gtins.add(ref["ean_input"])
 
     similarity = token_similarity(title, ref.get("base_title"))
     combined = round(min(1.0, similarity), 4)
 
     if gtins:
         if ref["ean_input"] in gtins:
-            notes.append("GTIN exato confirmado na página")
+            notes.append("GTIN exato confirmado na pagina")
             return {"status": "EXATO", "kit_combo_detectado": False, "notes": notes, "combined_score": 1.0}
-        notes.append(f"GTIN divergente na página: {', '.join(sorted(gtins)[:3])}")
+        notes.append(f"GTIN divergente na pagina: {', '.join(sorted(gtins)[:3])}")
         return {"status": "DIVERGENTE", "kit_combo_detectado": False, "notes": notes, "combined_score": combined}
 
     if combined >= 0.72:
-        notes.append(f"Validação por título ({combined:.2f})")
-        return {"status": "PROVÁVEL", "kit_combo_detectado": False, "notes": notes, "combined_score": combined}
+        notes.append(f"Validacao por titulo ({combined:.2f})")
+        return {"status": "PROVAVEL", "kit_combo_detectado": False, "notes": notes, "combined_score": combined}
     if combined >= 0.45:
-        notes.append(f"Validação parcial ({combined:.2f})")
-        return {"status": "NÃO CONFIRMADO", "kit_combo_detectado": False, "notes": notes, "combined_score": combined}
+        notes.append(f"Validacao parcial ({combined:.2f})")
+        return {"status": "NAO CONFIRMADO", "kit_combo_detectado": False, "notes": notes, "combined_score": combined}
 
-    return {"status": "DIVERGENTE", "kit_combo_detectado": False, "notes": [f"baixa aderência ({combined:.2f})"], "combined_score": combined}
+    return {
+        "status": "DIVERGENTE",
+        "kit_combo_detectado": False,
+        "notes": [f"baixa aderencia ({combined:.2f})"],
+        "combined_score": combined,
+    }
 
 
-def relevance_score(position: Optional[int], reviews: Optional[int], rating: Optional[float], multiple_sources: bool, validation_boost: float = 0.0) -> float:
+def relevance_score(
+    position: Optional[int],
+    reviews: Optional[int],
+    rating: Optional[float],
+    multiple_sources: bool,
+    validation_boost: float = 0.0,
+) -> float:
     score = 0.0
     if position is not None:
         score += max(0.0, 40.0 - (position * 3.0))
@@ -367,29 +396,21 @@ def relevance_label(score: float, reviews: Optional[int], position: Optional[int
     if score >= 55 or (position is not None and position <= 3) or (reviews is not None and reviews >= 100):
         return "ALTA"
     if score >= 35:
-        return "MÉDIA"
+        return "MEDIA"
     return "BAIXA"
-
-
-def infer_seller(store_name: Optional[str], source: Optional[str], url: Optional[str]) -> str:
-    if store_name and str(store_name).strip():
-        return str(store_name).strip()
-    if source and str(source).strip():
-        return str(source).strip()
-    return host_from_url(url) or "não visível"
 
 
 # ── SerpApi ───────────────────────────────────────────────────────────────────
 
 def serpapi_request(params: Dict[str, Any]) -> Dict[str, Any]:
     if not SERPAPI_KEY:
-        raise ExternalAPIError("SERPAPI_KEY não configurada no Render.")
+        raise ExternalAPIError("SERPAPI_KEY nao configurada no Render.")
     payload = dict(params)
     payload["api_key"] = SERPAPI_KEY
     try:
         response = requests.get(SERPAPI_ENDPOINT, params=payload, headers=HEADERS, timeout=HTTP_TIMEOUT)
     except requests.RequestException as exc:
-        raise ExternalAPIError(f"Falha de conexão com a SerpApi: {exc}") from exc
+        raise ExternalAPIError(f"Falha de conexao com a SerpApi: {exc}") from exc
 
     preview = response.text[:500] if response.text else ""
     if response.status_code >= 400:
@@ -403,7 +424,7 @@ def serpapi_request(params: Dict[str, Any]) -> Dict[str, Any]:
     try:
         data = response.json()
     except ValueError as exc:
-        raise ExternalAPIError(f"Resposta inválida da SerpApi: {preview}") from exc
+        raise ExternalAPIError(f"Resposta invalida da SerpApi: {preview}") from exc
 
     status = ((data.get("search_metadata") or {}).get("status") or "").lower()
     if data.get("error"):
@@ -420,17 +441,17 @@ def is_no_results_error(message: str) -> bool:
 
 def build_search_queries(ref: Dict[str, Any]) -> List[str]:
     ean = ref["ean_input"]
-    title = ref["base_title"] if ref["base_title"] != "não visível" else ""
+    title = ref["base_title"] if ref["base_title"] != "nao visivel" else ""
     title_tokens = [t for t in tokenize(title) if len(t) > 2]
     short_title = " ".join(list(title_tokens)[:8])
 
     candidates = [
-        f'"{ean}"' if not title else f'"{title}" "{ean}"',
+        f'"{title}" "{ean}"' if title else f'"{ean}"',
         f'ean {ean} {short_title}'.strip(),
         ean,
     ]
     out: List[str] = []
-    seen = set()
+    seen: set = set()
     for item in candidates:
         item = re.sub(r"\s+", " ", item).strip()
         if item and item not in seen:
@@ -455,7 +476,7 @@ def shopping_search(ref: Dict[str, Any], gl: str, hl: str, location: str) -> Dic
             if data.get("shopping_results"):
                 data["_query_used"] = query
                 return data
-            last_error = "Google Shopping não retornou resultados."
+            last_error = "Google Shopping nao retornou resultados."
         except ExternalAPIError as exc:
             last_error = str(exc)
             if is_no_results_error(last_error):
@@ -464,7 +485,9 @@ def shopping_search(ref: Dict[str, Any], gl: str, hl: str, location: str) -> Dic
     return {"shopping_results": [], "_query_used": None, "_notes": [last_error or "Sem resultados."]}
 
 
-def immersive_product(page_token: str, gl: str, hl: str, location: str, next_page_token: Optional[str] = None) -> Dict[str, Any]:
+def immersive_product(
+    page_token: str, gl: str, hl: str, location: str, next_page_token: Optional[str] = None
+) -> Dict[str, Any]:
     params: Dict[str, Any] = {
         "engine": "google_immersive_product",
         "gl": gl,
@@ -482,7 +505,9 @@ def immersive_product(page_token: str, gl: str, hl: str, location: str, next_pag
 
 # ── Build top 10 Google Shopping ─────────────────────────────────────────────
 
-def build_google_top10(ref: Dict[str, Any], gl: str, hl: str, location: str, max_products_per_entry: int) -> List[Dict[str, Any]]:
+def build_google_top10(
+    ref: Dict[str, Any], gl: str, hl: str, location: str, max_products_per_entry: int
+) -> List[Dict[str, Any]]:
     search_data = shopping_search(ref, gl, hl, location)
     shopping_results = search_data.get("shopping_results", []) or []
 
@@ -499,8 +524,7 @@ def build_google_top10(ref: Dict[str, Any], gl: str, hl: str, location: str, max
         candidate_product_link = result.get("product_link")
         candidate_multiple_sources = bool(result.get("multiple_sources"))
         candidate_price_num = result.get("extracted_price") or parse_money(result.get("price"))
-        candidate_delivery_raw = result.get("delivery")
-        candidate_delivery_num = parse_money(candidate_delivery_raw)
+        candidate_delivery_num = parse_money(result.get("delivery"))
         candidate_total_num = (
             candidate_price_num + candidate_delivery_num
             if candidate_price_num is not None and candidate_delivery_num is not None
@@ -514,7 +538,10 @@ def build_google_top10(ref: Dict[str, Any], gl: str, hl: str, location: str, max
             pages_collected = 0
             while pages_collected < 2:
                 try:
-                    product_data = immersive_product(page_token=page_token, gl=gl, hl=hl, location=location, next_page_token=next_page_token)
+                    product_data = immersive_product(
+                        page_token=page_token, gl=gl, hl=hl, location=location,
+                        next_page_token=next_page_token,
+                    )
                 except ExternalAPIError as exc:
                     logger.warning("Falha no immersive product para %s: %s", ref["ean_input"], exc)
                     break
@@ -531,29 +558,31 @@ def build_google_top10(ref: Dict[str, Any], gl: str, hl: str, location: str, max
                     reviews = store.get("reviews")
                     rating = store.get("rating")
                     combined_score = float(validation.get("combined_score") or 0.0)
-                    score = relevance_score(candidate_position, reviews, rating, candidate_multiple_sources, combined_score)
+                    score = relevance_score(
+                        candidate_position, reviews, rating, candidate_multiple_sources, combined_score
+                    )
 
                     price_num = store.get("extracted_price") or parse_money(store.get("price"))
                     ship_num = store.get("shipping_extracted")
                     if ship_num is None:
                         ship_num = parse_money(store.get("shipping"))
-                    total_num = (price_num + ship_num) if price_num is not None and ship_num is not None else price_num
-
-                    frete_gratis = (ship_num == 0.0)
+                    total_num = (
+                        (price_num + ship_num)
+                        if price_num is not None and ship_num is not None
+                        else price_num
+                    )
+                    frete_gratis = ship_num == 0.0
 
                     row = {
                         "ean": ref["ean_input"],
                         "ranking": 0,
                         "seller": infer_seller(store.get("name"), candidate_source, store_link),
                         "marketplace": marketplace_from_url(store_link, candidate_source),
-                        "produto": store.get("title") or candidate_title or "não visível",
+                        "produto": store.get("title") or candidate_title or "nao visivel",
                         "preco_produto": money_br(price_num),
-                        "frete": money_br(ship_num),
-                        "frete_gratis": "Sim" if frete_gratis else "Não",
+                        "frete_gratis": "Sim" if frete_gratis else "Nao",
                         "preco_total": money_br(total_num),
-                        "avaliacoes": reviews if reviews is not None else "não visível",
-                        "nota": rating if rating is not None else "não visível",
-                        "link": store_link or candidate_product_link or "não visível",
+                        "link": store_link or candidate_product_link or "nao visivel",
                         "status_validacao": validation["status"],
                         "relevancia": relevance_label(score, reviews, candidate_position),
                         "_score": score,
@@ -578,22 +607,21 @@ def build_google_top10(ref: Dict[str, Any], gl: str, hl: str, location: str, max
             reviews = result.get("reviews")
             rating = result.get("rating")
             combined_score = float(validation.get("combined_score") or 0.0)
-            score = relevance_score(candidate_position, reviews, rating, candidate_multiple_sources, combined_score)
-            frete_gratis = (candidate_delivery_num == 0.0)
+            score = relevance_score(
+                candidate_position, reviews, rating, candidate_multiple_sources, combined_score
+            )
+            frete_gratis = candidate_delivery_num == 0.0
 
             row = {
                 "ean": ref["ean_input"],
                 "ranking": 0,
                 "seller": infer_seller(None, candidate_source, candidate_product_link),
                 "marketplace": marketplace_from_url(candidate_product_link, candidate_source),
-                "produto": candidate_title or "não visível",
+                "produto": candidate_title or "nao visivel",
                 "preco_produto": money_br(candidate_price_num),
-                "frete": money_br(candidate_delivery_num) if candidate_delivery_num is not None else (candidate_delivery_raw or "não visível"),
-                "frete_gratis": "Sim" if frete_gratis else "Não",
+                "frete_gratis": "Sim" if frete_gratis else "Nao",
                 "preco_total": money_br(candidate_total_num),
-                "avaliacoes": reviews if reviews is not None else "não visível",
-                "nota": rating if rating is not None else "não visível",
-                "link": candidate_product_link or "não visível",
+                "link": candidate_product_link or "nao visivel",
                 "status_validacao": validation["status"],
                 "relevancia": relevance_label(score, reviews, candidate_position),
                 "_score": score,
@@ -604,7 +632,6 @@ def build_google_top10(ref: Dict[str, Any], gl: str, hl: str, location: str, max
                 seen.add(key)
                 all_rows.append(row)
 
-    # Ordena por score desc, depois preço asc
     all_rows.sort(key=lambda x: (-x["_score"], x["_price_num"] or 10**9))
 
     top10 = all_rows[:10]
@@ -634,16 +661,14 @@ def percentile(values: List[float], p: float) -> Optional[float]:
 
 
 def summarize_entry(ref: Dict[str, Any], top10: List[Dict[str, Any]]) -> Dict[str, Any]:
-    eligible = [r for r in top10 if r["status_validacao"] in {"EXATO", "PROVÁVEL"}]
     prices: List[float] = []
     for r in top10:
-        # Tenta extrair o número do campo formatado
         raw = r.get("preco_total", "")
         if isinstance(raw, str):
             num = parse_money(raw.replace("R$", "").replace(".", "").replace(",", ".").strip())
         else:
             num = parse_money(raw)
-        if num is not None:
+        if num is not None and num > 0:
             prices.append(num)
 
     min_price = min(prices) if prices else None
@@ -654,8 +679,11 @@ def summarize_entry(ref: Dict[str, Any], top10: List[Dict[str, Any]]) -> Dict[st
 
     com_frete_gratis = sum(1 for r in top10 if r.get("frete_gratis") == "Sim")
     lider = top10[0] if top10 else None
-
-    faixa_ideal = f"{money_br(p25)} a {money_br(p45)}" if p25 is not None and p45 is not None else "não visível"
+    faixa_ideal = (
+        f"{money_br(p25)} a {money_br(p45)}"
+        if p25 is not None and p45 is not None
+        else "nao visivel"
+    )
 
     return {
         "ean": ref["ean_input"],
@@ -668,8 +696,23 @@ def summarize_entry(ref: Dict[str, Any], top10: List[Dict[str, Any]]) -> Dict[st
         "faixa_ideal_sugerida": faixa_ideal,
         "vendedores_com_frete_gratis": com_frete_gratis,
         "total_vendedores_top10": len(top10),
-        "seller_lider": lider["seller"] if lider else "não visível",
-        "marketplace_lider": lider["marketplace"] if lider else "não visível",
+        "seller_lider": lider["seller"] if lider else "nao visivel",
+        "marketplace_lider": lider["marketplace"] if lider else "nao visivel",
+    }
+
+
+# ── Processamento de uma entrada (paralelo) ───────────────────────────────────
+
+def process_entry(
+    entry: EntryInput, gl: str, hl: str, location: str, max_products_per_entry: int
+) -> Dict[str, Any]:
+    ref = fetch_base_reference(entry)
+    top10 = build_google_top10(ref, gl, hl, location, max_products_per_entry)
+    summary = summarize_entry(ref, top10)
+    return {
+        "ean": entry.ean,
+        "summary": summary,
+        "top10": top10,
     }
 
 
@@ -681,27 +724,50 @@ def health() -> Dict[str, Any]:
 
 
 @app.post("/analyze")
-def analyze(payload: AnalyzeRequest, x_app_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+def analyze(
+    payload: AnalyzeRequest, x_app_token: Optional[str] = Header(default=None)
+) -> Dict[str, Any]:
     if APP_TOKEN and x_app_token != APP_TOKEN:
-        raise HTTPException(status_code=401, detail="Token inválido.")
+        raise HTTPException(status_code=401, detail="Token invalido.")
 
-    products: List[Dict[str, Any]] = []
+    n = len(payload.entries)
+    max_workers = min(n, 5)  # paraleliza ate 5 produtos simultaneamente
 
-    try:
-        for entry in payload.entries:
-            ref = fetch_base_reference(entry)
-            top10 = build_google_top10(ref, payload.gl, payload.hl, payload.location, payload.max_products_per_entry)
-            summary = summarize_entry(ref, top10)
-            products.append({
-                "ean": entry.ean,
-                "summary": summary,
-                "top10": top10,
-            })
-    except ExternalAPIError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-    except Exception as exc:
-        logger.exception("Erro interno no worker")
-        raise HTTPException(status_code=500, detail=f"Erro interno: {exc}")
+    results: Dict[int, Dict[str, Any]] = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(
+                process_entry,
+                entry,
+                payload.gl,
+                payload.hl,
+                payload.location,
+                payload.max_products_per_entry,
+            ): idx
+            for idx, entry in enumerate(payload.entries)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except ExternalAPIError as exc:
+                results[idx] = {
+                    "ean": payload.entries[idx].ean,
+                    "summary": {},
+                    "top10": [],
+                    "error": str(exc),
+                }
+            except Exception as exc:
+                logger.exception("Erro ao processar EAN %s", payload.entries[idx].ean)
+                results[idx] = {
+                    "ean": payload.entries[idx].ean,
+                    "summary": {},
+                    "top10": [],
+                    "error": f"erro interno: {exc}",
+                }
+
+    products = [results[i] for i in range(n)]
 
     return {
         "meta": {
