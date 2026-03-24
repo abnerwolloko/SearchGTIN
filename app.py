@@ -1,4 +1,3 @@
-
 import json
 import logging
 import math
@@ -8,7 +7,7 @@ import statistics
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -33,23 +32,28 @@ HEADERS = {
 }
 
 GTIN_KEYS = {"gtin", "gtin8", "gtin12", "gtin13", "gtin14", "ean", "isbn"}
+
 KIT_PATTERNS = [
     r"\bkit\b", r"\bcombo\b", r"\bconjunto\b", r"\bbundle\b", r"\bpack\b", r"\bduo\b",
     r"\bdupla\b", r"\bpar\b", r"\bc\/2\b", r"\bc\/3\b", r"\b2x\b", r"\b3x\b",
     r"\b2 unidades\b", r"\b3 unidades\b", r"\b2 un\b", r"\b3 un\b",
 ]
+
 STOPWORDS = {
     "de", "da", "do", "das", "dos", "para", "com", "sem", "e", "a", "o", "as", "os",
     "um", "uma", "the", "with", "by", "in", "on", "new", "novo", "nova",
+    # ruído de títulos de loja
+    "compre", "compra", "frete", "gratis", "entrega", "rapida", "rapido",
+    "oferta", "promocao", "menor", "preco", "melhor",
 }
 
-# ── Statuses aceitos no resultado final ──────────────────────────────────────
-# Apenas produtos EXATOS ou PROVÁVEIS são incluídos no top10.
-# DIVERGENTE e NAO_CONFIRMADO são descartados silenciosamente.
-ACCEPTED_STATUSES = {"EXATO", "PROVAVEL"}
+# Apenas esses statuses entram no resultado final.
+# PROVAVEL_TITULO é aceito somente quando o scraping não encontrou nenhum GTIN
+# (página bloqueou bots, GTIN não publicado, etc.).
+ACCEPTED_STATUSES = {"EXATO", "PROVAVEL_TITULO"}
 
 logger = logging.getLogger("uvicorn.error")
-app = FastAPI(title="Google Shopping GTIN Analyzer", version="4.1.0")
+app = FastAPI(title="Google Shopping GTIN Analyzer", version="4.2.0")
 
 
 class ExternalAPIError(Exception):
@@ -82,7 +86,7 @@ class AnalyzeRequest(BaseModel):
     gl: str = Field(default="br")
     hl: str = Field(default="pt-BR")
     location: str = Field(default="Brazil")
-    max_products_per_entry: int = Field(default=6, ge=1, le=10)
+    max_products_per_entry: int = Field(default=8, ge=1, le=20)
 
     @field_validator("entries")
     @classmethod
@@ -120,12 +124,58 @@ def tokenize(value: Optional[str]) -> Set[str]:
     return {t for t in normalize_text(value).split() if len(t) > 1 and t not in STOPWORDS}
 
 
-def token_similarity(a: Optional[str], b: Optional[str]) -> float:
-    sa = tokenize(a)
-    sb = tokenize(b)
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
+def clean_store_title(raw_title: Optional[str]) -> str:
+    """
+    Remove sufixos típicos de títulos de páginas de lojas que contaminam
+    a comparação de similaridade.
+    Ex: 'Produto X - Compre na Loja Y | Frete Grátis' → 'Produto X'
+    """
+    if not raw_title:
+        return ""
+    for sep in [" | ", " - ", " – ", " — "]:
+        if sep in raw_title:
+            raw_title = raw_title.split(sep)[0]
+    return raw_title.strip()
+
+
+def key_tokens(value: Optional[str]) -> Set[str]:
+    """
+    Extrai tokens discriminativos do produto: números (modelo, capacidade),
+    siglas e palavras longas (marca, nome).
+    Esses tokens têm peso maior na validação por título.
+    """
+    tokens = tokenize(value)
+    key: Set[str] = set()
+    for t in tokens:
+        if re.search(r"\d", t):           # contém número → capacidade, modelo, versão
+            key.add(t)
+        elif len(t) <= 5 and t.upper() == normalize_text(t).upper():
+            key.add(t)                    # sigla curta (USB, HDMI, etc.)
+        elif len(t) > 4:                  # palavra longa → nome, marca
+            key.add(t)
+    return key
+
+
+def title_match_score(candidate: Optional[str], reference: Optional[str]) -> Tuple[float, float]:
+    """
+    Retorna (jaccard_geral, key_overlap).
+
+    jaccard_geral  : Jaccard sobre todos os tokens sem stopwords.
+    key_overlap    : proporção dos tokens-chave da referência presentes no candidato.
+                     É mais discriminativo — detecta diferenças de modelo/capacidade.
+    """
+    cand_clean = clean_store_title(candidate)
+    ref_clean  = clean_store_title(reference)
+
+    sc = tokenize(cand_clean)
+    sr = tokenize(ref_clean)
+    jaccard = len(sc & sr) / len(sc | sr) if (sc and sr) else 0.0
+
+    kr = key_tokens(ref_clean)
+    kc = key_tokens(cand_clean)
+    key_overlap = len(kr & kc) / len(kr) if kr else 0.0
+
+    return round(jaccard, 4), round(key_overlap, 4)
 
 
 def looks_like_kit_or_combo(text: Optional[str]) -> bool:
@@ -211,7 +261,6 @@ def marketplace_from_url(url: Optional[str], source: Optional[str] = None) -> st
 
 
 def infer_seller(store_name: Optional[str], source: Optional[str], url: Optional[str]) -> str:
-    """Retorna o nome do vendedor/loja da forma mais legível possível."""
     if store_name and str(store_name).strip():
         return str(store_name).strip()
     if source and str(source).strip():
@@ -262,6 +311,8 @@ def collect_gtins_from_json(obj: Any, out: Set[str]) -> None:
 def extract_gtins_from_html(html: str) -> Set[str]:
     found: Set[str] = set()
     soup = BeautifulSoup(html or "", "html.parser")
+
+    # JSON-LD estruturado
     for script in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
         raw = (script.string or script.get_text() or "").strip()
         if not raw:
@@ -274,6 +325,8 @@ def extract_gtins_from_html(html: str) -> Set[str]:
                 r'"(?:gtin|gtin8|gtin12|gtin13|gtin14|ean)"\s*:\s*"(\d{8,14})"', raw, flags=re.I
             ):
                 found.add(match.group(1))
+
+    # Microdados / itemprop
     for tag in soup.select("[itemprop]"):
         itemprop = (tag.get("itemprop") or "").strip().lower()
         if itemprop in GTIN_KEYS:
@@ -281,10 +334,21 @@ def extract_gtins_from_html(html: str) -> Set[str]:
             d = digits_only(value)
             if d:
                 found.add(d)
+
+    # Regex genérico no HTML bruto
     for match in re.finditer(
         r'(?:gtin|gtin8|gtin12|gtin13|gtin14|ean)[^0-9]{0,25}(\d{8,14})', html, flags=re.I
     ):
         found.add(match.group(1))
+
+    # Atributos data-ean / data-gtin (comum em lojas BR)
+    for tag in soup.find_all(True):
+        for attr, val in tag.attrs.items():
+            if "ean" in attr.lower() or "gtin" in attr.lower():
+                d = digits_only(str(val))
+                if d and len(d) in (8, 12, 13, 14):
+                    found.add(d)
+
     return found
 
 
@@ -298,14 +362,22 @@ def fetch_base_reference(entry: EntryInput) -> Dict[str, Any]:
     html = requests_get_text(url)
     html_gtins = extract_gtins_from_html(html or "") if html else set()
 
-    title = None
+    raw_title = None
     if html:
         soup = BeautifulSoup(html, "html.parser")
+        # Prioridade: og:title → h1 → <title>
         og = soup.find("meta", property="og:title")
         if og and og.get("content"):
-            title = og["content"].strip()
-        elif soup.title:
-            title = soup.title.get_text(" ", strip=True)
+            raw_title = og["content"].strip()
+        else:
+            h1 = soup.find("h1")
+            if h1:
+                raw_title = h1.get_text(" ", strip=True)
+            elif soup.title:
+                raw_title = soup.title.get_text(" ", strip=True)
+
+    # Remove ruído de sufixo de loja do título
+    title = clean_store_title(raw_title) if raw_title else None
 
     gtins_found = sorted(html_gtins)
 
@@ -333,25 +405,28 @@ def fetch_base_reference(entry: EntryInput) -> Dict[str, Any]:
     }
 
 
-# ── Validação e relevância ────────────────────────────────────────────────────
+# ── Validação de oferta ───────────────────────────────────────────────────────
 
 def validate_offer(ref: Dict[str, Any], title: Optional[str], url: Optional[str]) -> Dict[str, Any]:
     """
-    Retorna status de validação do produto candidato em relação ao EAN de referência.
+    Hierarquia de decisão:
 
-    Hierarquia de decisão (do mais ao menos confiável):
-      1. Kit/combo detectado no título           → EXCLUIDO (sempre descartado)
-      2. GTIN exato confirmado via scraping      → EXATO    (aceito)
-      3. GTIN diferente encontrado via scraping  → DIVERGENTE (descartado)
-      4. Sem GTIN na página + título ≥ 0.72      → PROVAVEL (aceito)
-      5. Sem GTIN na página + título 0.45–0.71   → NAO CONFIRMADO (descartado)
-      6. Demais casos                             → DIVERGENTE (descartado)
+    1. Kit/combo no título                       → EXCLUIDO         ❌ descartado
+    2. GTIN exato confirmado via scraping        → EXATO            ✅ aceito
+    3. GTIN diferente encontrado via scraping    → DIVERGENTE       ❌ descartado
+    4. Scraping sem resultado (bloqueado/sem GTIN publicado):
+       a. key_overlap ≥ 0.60 E jaccard ≥ 0.35   → PROVAVEL_TITULO  ✅ aceito
+       b. Qualquer outro caso                    → NAO_CONFIRMADO   ❌ descartado
 
-    Apenas EXATO e PROVAVEL chegam ao resultado final (filtrado em build_google_top10).
+    Lógica do critério 4a:
+    - key_overlap mede presença de tokens discriminativos (número de modelo, capacidade).
+      Ex: "Galaxy A55 128GB" vs "Galaxy A55 256GB" → key_overlap baixo (128 ≠ 256) → REJEITADO.
+    - Exige AMBOS os critérios para minimizar falsos positivos.
+    - Ser mais permissivo aqui traria de volta o problema original de produtos errados.
     """
     notes: List[str] = []
 
-    # ── 1. Rejeição imediata: kit/combo ──────────────────────────────────────
+    # 1. Kit/combo
     if looks_like_kit_or_combo(title):
         return {
             "status": "EXCLUIDO - KIT/COMBO",
@@ -360,15 +435,14 @@ def validate_offer(ref: Dict[str, Any], title: Optional[str], url: Optional[str]
             "combined_score": 0.0,
         }
 
-    # ── 2 & 3. Tentativa de confirmar/rejeitar via GTIN na página ────────────
+    # 2 & 3. Tenta confirmar via GTIN na página do candidato
     gtins: Set[str] = set()
+    scraping_attempted = False
     if url and url != "nao visivel":
+        scraping_attempted = True
         html = requests_get_text(url)
         if html:
             gtins = extract_gtins_from_html(html)
-
-    similarity = token_similarity(title, ref.get("base_title"))
-    combined = round(min(1.0, similarity), 4)
 
     if gtins:
         if ref["ean_input"] in gtins:
@@ -379,39 +453,33 @@ def validate_offer(ref: Dict[str, Any], title: Optional[str], url: Optional[str]
                 "notes": notes,
                 "combined_score": 1.0,
             }
-        # GTIN encontrado na página, mas é diferente → produto errado
+        # GTIN presente mas diferente → produto claramente errado
         notes.append(f"GTIN divergente na pagina: {', '.join(sorted(gtins)[:3])}")
         return {
             "status": "DIVERGENTE",
             "kit_combo_detectado": False,
             "notes": notes,
-            "combined_score": 0.0,   # forçado para 0 — produto errado
+            "combined_score": 0.0,
         }
 
-    # ── 4 & 5 & 6. Sem GTIN na página — decide por similaridade de título ────
-    # Requer similaridade alta (≥ 0.72) para aceitar como PROVAVEL.
-    # Abaixo disso é NAO_CONFIRMADO ou DIVERGENTE, ambos descartados.
-    if combined >= 0.72:
-        notes.append(f"Validacao por titulo ({combined:.2f})")
+    # 4. Sem GTIN encontrado — valida por título
+    jaccard, key_overlap = title_match_score(title, ref.get("base_title"))
+    scraping_note = "scraping sem GTIN" if scraping_attempted else "sem URL para scraping"
+    notes.append(f"{scraping_note} — jaccard={jaccard:.2f} key_overlap={key_overlap:.2f}")
+
+    if key_overlap >= 0.60 and jaccard >= 0.35:
+        combined = round(key_overlap * 0.7 + jaccard * 0.3, 4)
         return {
-            "status": "PROVAVEL",
+            "status": "PROVAVEL_TITULO",
             "kit_combo_detectado": False,
             "notes": notes,
             "combined_score": combined,
         }
-    if combined >= 0.45:
-        notes.append(f"Similaridade insuficiente ({combined:.2f}) — produto nao confirmado")
-        return {
-            "status": "NAO CONFIRMADO",
-            "kit_combo_detectado": False,
-            "notes": notes,
-            "combined_score": 0.0,   # forçado para 0 — não será aceito
-        }
 
     return {
-        "status": "DIVERGENTE",
+        "status": "NAO_CONFIRMADO",
         "kit_combo_detectado": False,
-        "notes": [f"baixa aderencia ({combined:.2f})"],
+        "notes": notes,
         "combined_score": 0.0,
     }
 
@@ -485,23 +553,29 @@ def is_no_results_error(message: str) -> bool:
 
 def build_search_queries(ref: Dict[str, Any]) -> List[str]:
     """
-    Constrói queries priorizando resultados que contenham o EAN/GTIN.
-    A query com EAN entre aspas é sempre a primeira e mais restritiva.
-    A fallback sem EAN só é usada se as anteriores não retornarem resultados.
+    Estratégia de busca em 3 camadas — da mais precisa à mais ampla:
+
+    1. Título limpo + EAN  → melhor cobertura: Google Shopping BR indexa bem por título
+    2. Só o EAN            → fallback quando título não retorna resultados
+    3. Só o título         → último recurso; produtos validados depois pelo GTIN via scraping
+
+    NÃO usamos EAN entre aspas duplas como query primária porque o Google Shopping BR
+    frequentemente retorna zero resultados para EAN isolado com aspas.
     """
     ean = ref["ean_input"]
     title = ref["base_title"] if ref["base_title"] != "nao visivel" else ""
     title_tokens = [t for t in tokenize(title) if len(t) > 2]
-    short_title = " ".join(list(title_tokens)[:6])
+    short_title = " ".join(list(title_tokens)[:7])
 
-    candidates = [
-        # 1ª opção: EAN entre aspas (mais precisa — força o EAN na query)
-        f'"{ean}"',
-        # 2ª opção: EAN + fragmento de título para desambiguar
-        f'"{ean}" {short_title}'.strip() if short_title else None,
-        # 3ª opção: "ean XXXXX nome" como fallback
-        f'ean {ean} {short_title}'.strip() if short_title else f'ean {ean}',
-    ]
+    candidates: List[Optional[str]] = []
+
+    if short_title:
+        candidates.append(f"{short_title} {ean}")   # primária: título + EAN
+        candidates.append(ean)                       # fallback 1: só EAN
+        candidates.append(short_title)               # fallback 2: só título
+    else:
+        candidates.append(ean)
+
     out: List[str] = []
     seen: set = set()
     for item in candidates:
@@ -511,7 +585,7 @@ def build_search_queries(ref: Dict[str, Any]) -> List[str]:
         if item and item not in seen:
             out.append(item)
             seen.add(item)
-    return out or [f'"{ean}"']
+    return out or [ean]
 
 
 def shopping_search(ref: Dict[str, Any], gl: str, hl: str, location: str) -> Dict[str, Any]:
@@ -529,6 +603,7 @@ def shopping_search(ref: Dict[str, Any], gl: str, hl: str, location: str) -> Dic
             })
             if data.get("shopping_results"):
                 data["_query_used"] = query
+                logger.info("EAN %s — query usada: %s", ref["ean_input"], query)
                 return data
             last_error = "Google Shopping nao retornou resultados."
         except ExternalAPIError as exc:
@@ -572,12 +647,12 @@ def build_google_top10(
         return []
 
     for search_rank, result in enumerate(shopping_results[:max_products_per_entry], start=1):
-        candidate_title = result.get("title")
+        candidate_title    = result.get("title")
         candidate_position = result.get("position") or search_rank
-        candidate_source = result.get("source")
-        candidate_product_link = result.get("product_link")
+        candidate_source   = result.get("source")
+        candidate_product_link     = result.get("product_link")
         candidate_multiple_sources = bool(result.get("multiple_sources"))
-        candidate_price_num = result.get("extracted_price") or parse_money(result.get("price"))
+        candidate_price_num    = result.get("extracted_price") or parse_money(result.get("price"))
         candidate_delivery_num = parse_money(result.get("delivery"))
         candidate_total_num = (
             candidate_price_num + candidate_delivery_num
@@ -604,29 +679,28 @@ def build_google_top10(
                 stores = product_results.get("stores", []) or []
 
                 for store in stores:
-                    store_link = store.get("link")
-                    validation = validate_offer(ref, store.get("title") or candidate_title, store_link)
+                    store_link  = store.get("link")
+                    store_title = store.get("title") or candidate_title
+                    validation  = validate_offer(ref, store_title, store_link)
 
-                    # ── FILTRO PRINCIPAL: descarta tudo que não for EXATO ou PROVAVEL ──
                     if validation["kit_combo_detectado"]:
                         continue
                     if validation["status"] not in ACCEPTED_STATUSES:
                         logger.debug(
-                            "Descartado (status=%s, ean=%s, titulo=%s)",
-                            validation["status"], ref["ean_input"],
-                            store.get("title") or candidate_title,
+                            "Descartado store status=%s ean=%s titulo=%s",
+                            validation["status"], ref["ean_input"], store_title,
                         )
                         continue
 
                     reviews = store.get("reviews")
-                    rating = store.get("rating")
+                    rating  = store.get("rating")
                     combined_score = float(validation.get("combined_score") or 0.0)
                     score = relevance_score(
                         candidate_position, reviews, rating, candidate_multiple_sources, combined_score
                     )
 
                     price_num = store.get("extracted_price") or parse_money(store.get("price"))
-                    ship_num = store.get("shipping_extracted")
+                    ship_num  = store.get("shipping_extracted")
                     if ship_num is None:
                         ship_num = parse_money(store.get("shipping"))
                     total_num = (
@@ -641,7 +715,7 @@ def build_google_top10(
                         "ranking": 0,
                         "seller": infer_seller(store.get("name"), candidate_source, store_link),
                         "marketplace": marketplace_from_url(store_link, candidate_source),
-                        "produto": store.get("title") or candidate_title or "nao visivel",
+                        "produto": store_title or "nao visivel",
                         "preco_produto": money_br(price_num),
                         "frete_gratis": "Sim" if frete_gratis else "Nao",
                         "preco_total": money_br(total_num),
@@ -662,21 +736,21 @@ def build_google_top10(
                 if not next_page_token:
                     break
 
+        # Fallback: sem immersive, ou todas as stores do immersive foram descartadas
         if not product_rows_created:
             validation = validate_offer(ref, candidate_title, candidate_product_link)
 
-            # ── FILTRO PRINCIPAL (fallback sem immersive) ─────────────────────
             if validation["kit_combo_detectado"]:
                 continue
             if validation["status"] not in ACCEPTED_STATUSES:
                 logger.debug(
-                    "Descartado fallback (status=%s, ean=%s, titulo=%s)",
+                    "Descartado fallback status=%s ean=%s titulo=%s",
                     validation["status"], ref["ean_input"], candidate_title,
                 )
                 continue
 
             reviews = result.get("reviews")
-            rating = result.get("rating")
+            rating  = result.get("rating")
             combined_score = float(validation.get("combined_score") or 0.0)
             score = relevance_score(
                 candidate_position, reviews, rating, candidate_multiple_sources, combined_score
@@ -723,7 +797,7 @@ def percentile(values: List[float], p: float) -> Optional[float]:
         return values[0]
     values = sorted(values)
     rank = (len(values) - 1) * (p / 100.0)
-    low = math.floor(rank)
+    low  = math.floor(rank)
     high = math.ceil(rank)
     if low == high:
         return values[low]
@@ -772,12 +846,12 @@ def summarize_entry(ref: Dict[str, Any], top10: List[Dict[str, Any]]) -> Dict[st
     }
 
 
-# ── Processamento de uma entrada (paralelo) ───────────────────────────────────
+# ── Processamento de uma entrada ──────────────────────────────────────────────
 
 def process_entry(
     entry: EntryInput, gl: str, hl: str, location: str, max_products_per_entry: int
 ) -> Dict[str, Any]:
-    ref = fetch_base_reference(entry)
+    ref  = fetch_base_reference(entry)
     top10 = build_google_top10(ref, gl, hl, location, max_products_per_entry)
     summary = summarize_entry(ref, top10)
     return {
