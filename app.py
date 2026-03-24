@@ -685,15 +685,18 @@ def analyze(payload: AnalyzeRequest, x_app_token: Optional[str] = Header(default
     if APP_TOKEN and x_app_token != APP_TOKEN:
         raise HTTPException(status_code=401, detail="Token inválido.")
 
-    all_top10: List[Dict[str, Any]] = []
-    summaries: List[Dict[str, Any]] = []
+    products: List[Dict[str, Any]] = []
 
     try:
         for entry in payload.entries:
             ref = fetch_base_reference(entry)
             top10 = build_google_top10(ref, payload.gl, payload.hl, payload.location, payload.max_products_per_entry)
-            all_top10.extend(top10)
-            summaries.append(summarize_entry(ref, top10))
+            summary = summarize_entry(ref, top10)
+            products.append({
+                "ean": entry.ean,
+                "summary": summary,
+                "top10": top10,
+            })
     except ExternalAPIError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     except Exception as exc:
@@ -707,6 +710,5 @@ def analyze(payload: AnalyzeRequest, x_app_token: Optional[str] = Header(default
             "gl": payload.gl,
             "hl": payload.hl,
         },
-        "summary": summaries,
-        "top10": all_top10,
+        "products": products,
     }
