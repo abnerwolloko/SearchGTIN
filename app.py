@@ -7,7 +7,7 @@ import statistics
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlparse
 
 import requests
@@ -25,32 +25,22 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
-
 HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
 }
 
 GTIN_KEYS = {"gtin", "gtin8", "gtin12", "gtin13", "gtin14", "ean", "isbn"}
-
 KIT_PATTERNS = [
     r"\bkit\b", r"\bcombo\b", r"\bconjunto\b", r"\bbundle\b", r"\bpack\b", r"\bduo\b",
     r"\bdupla\b", r"\bpar\b", r"\bc\/2\b", r"\bc\/3\b", r"\b2x\b", r"\b3x\b",
     r"\b2 unidades\b", r"\b3 unidades\b", r"\b2 un\b", r"\b3 un\b",
 ]
-
 STOPWORDS = {
-    "de", "da", "do", "das", "dos", "para", "com", "sem", "e", "a", "o", "as", "os",
-    "um", "uma", "the", "with", "by", "in", "on", "new", "novo", "nova",
-    # ruído de títulos de loja
-    "compre", "compra", "frete", "gratis", "entrega", "rapida", "rapido",
-    "oferta", "promocao", "menor", "preco", "melhor",
+    "de","da","do","das","dos","para","com","sem","e","a","o","as","os",
+    "um","uma","the","with","by","in","on","new","novo","nova",
 }
-
-# Apenas esses statuses entram no resultado final.
-# PROVAVEL_TITULO é aceito somente quando o scraping não encontrou nenhum GTIN
-# (página bloqueou bots, GTIN não publicado, etc.).
-ACCEPTED_STATUSES = {"EXATO", "PROVAVEL_TITULO"}
+ACCEPTED_STATUSES = {"EXATO", "PROVAVEL"}
 
 logger = logging.getLogger("uvicorn.error")
 app = FastAPI(title="Google Shopping GTIN Analyzer", version="4.2.0")
@@ -62,23 +52,23 @@ class ExternalAPIError(Exception):
 
 class EntryInput(BaseModel):
     ean: str = Field(..., description="GTIN/EAN do produto")
-    base_url: str = Field(..., description="URL de referência do produto (qualquer loja)")
+    base_url: str = Field(..., description="URL de referencia do produto")
 
     @field_validator("ean")
     @classmethod
-    def validate_ean(cls, value: str) -> str:
-        digits = digits_only(value)
-        if len(digits) not in (8, 12, 13, 14):
-            raise ValueError("GTIN/EAN inválido.")
-        return digits
+    def validate_ean(cls, v):
+        d = digits_only(v)
+        if len(d) not in (8,12,13,14):
+            raise ValueError("GTIN/EAN invalido.")
+        return d
 
     @field_validator("base_url")
     @classmethod
-    def validate_base_url(cls, value: str) -> str:
-        value = (value or "").strip()
-        if not value.lower().startswith(("http://", "https://")):
-            raise ValueError("A URL precisa comecar com http:// ou https://")
-        return value
+    def validate_base_url(cls, v):
+        v = (v or "").strip()
+        if not v.lower().startswith(("http://","https://")):
+            raise ValueError("URL precisa comecar com http:// ou https://")
+        return v
 
 
 class AnalyzeRequest(BaseModel):
@@ -86,840 +76,576 @@ class AnalyzeRequest(BaseModel):
     gl: str = Field(default="br")
     hl: str = Field(default="pt-BR")
     location: str = Field(default="Brazil")
-    max_products_per_entry: int = Field(default=8, ge=1, le=20)
+    max_products_per_entry: int = Field(default=6, ge=1, le=10)
 
     @field_validator("entries")
     @classmethod
-    def validate_entries(cls, values: List[EntryInput]) -> List[EntryInput]:
-        if not values:
-            raise ValueError("Informe pelo menos 1 entrada.")
-        if len(values) > 10:
-            raise ValueError("Maximo de 10 entradas por execucao.")
-        seen: set = set()
-        unique = []
+    def validate_entries(cls, values):
+        if not values: raise ValueError("Informe pelo menos 1 entrada.")
+        if len(values) > 10: raise ValueError("Maximo de 10 entradas por execucao.")
+        seen, unique = set(), []
         for item in values:
-            key = (item.ean, item.base_url)
-            if key not in seen:
-                unique.append(item)
-                seen.add(key)
+            k = (item.ean, item.base_url)
+            if k not in seen:
+                unique.append(item); seen.add(k)
         return unique
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# --- helpers ---
 
-def digits_only(value: str) -> str:
-    return re.sub(r"\D+", "", value or "")
+def digits_only(v):
+    return re.sub(r"\D+", "", v or "")
 
+def normalize_text(v):
+    v = v or ""
+    v = unicodedata.normalize("NFKD", v)
+    v = "".join(ch for ch in v if not unicodedata.combining(ch))
+    v = v.lower()
+    v = re.sub(r"[^a-z0-9]+"," ", v)
+    return re.sub(r"\s+"," ", v).strip()
 
-def normalize_text(value: Optional[str]) -> str:
-    value = value or ""
-    value = unicodedata.normalize("NFKD", value)
-    value = "".join(ch for ch in value if not unicodedata.combining(ch))
-    value = value.lower()
-    value = re.sub(r"[^a-z0-9]+", " ", value)
-    return re.sub(r"\s+", " ", value).strip()
+def tokenize(v):
+    return {t for t in normalize_text(v).split() if len(t)>1 and t not in STOPWORDS}
 
+def token_similarity(a, b):
+    sa, sb = tokenize(a), tokenize(b)
+    if not sa or not sb: return 0.0
+    return len(sa&sb)/len(sa|sb)
 
-def tokenize(value: Optional[str]) -> Set[str]:
-    return {t for t in normalize_text(value).split() if len(t) > 1 and t not in STOPWORDS}
-
-
-def clean_store_title(raw_title: Optional[str]) -> str:
-    """
-    Remove sufixos típicos de títulos de páginas de lojas que contaminam
-    a comparação de similaridade.
-    Ex: 'Produto X - Compre na Loja Y | Frete Grátis' → 'Produto X'
-    """
-    if not raw_title:
-        return ""
-    for sep in [" | ", " - ", " – ", " — "]:
-        if sep in raw_title:
-            raw_title = raw_title.split(sep)[0]
-    return raw_title.strip()
-
-
-def key_tokens(value: Optional[str]) -> Set[str]:
-    """
-    Extrai tokens discriminativos do produto: números (modelo, capacidade),
-    siglas e palavras longas (marca, nome).
-    Esses tokens têm peso maior na validação por título.
-    """
-    tokens = tokenize(value)
-    key: Set[str] = set()
-    for t in tokens:
-        if re.search(r"\d", t):           # contém número → capacidade, modelo, versão
-            key.add(t)
-        elif len(t) <= 5 and t.upper() == normalize_text(t).upper():
-            key.add(t)                    # sigla curta (USB, HDMI, etc.)
-        elif len(t) > 4:                  # palavra longa → nome, marca
-            key.add(t)
-    return key
-
-
-def title_match_score(candidate: Optional[str], reference: Optional[str]) -> Tuple[float, float]:
-    """
-    Retorna (jaccard_geral, key_overlap).
-
-    jaccard_geral  : Jaccard sobre todos os tokens sem stopwords.
-    key_overlap    : proporção dos tokens-chave da referência presentes no candidato.
-                     É mais discriminativo — detecta diferenças de modelo/capacidade.
-    """
-    cand_clean = clean_store_title(candidate)
-    ref_clean  = clean_store_title(reference)
-
-    sc = tokenize(cand_clean)
-    sr = tokenize(ref_clean)
-    jaccard = len(sc & sr) / len(sc | sr) if (sc and sr) else 0.0
-
-    kr = key_tokens(ref_clean)
-    kc = key_tokens(cand_clean)
-    key_overlap = len(kr & kc) / len(kr) if kr else 0.0
-
-    return round(jaccard, 4), round(key_overlap, 4)
-
-
-def looks_like_kit_or_combo(text: Optional[str]) -> bool:
+def looks_like_kit_or_combo(text):
     txt = normalize_text(text)
-    return any(re.search(pattern, txt) for pattern in KIT_PATTERNS)
+    return any(re.search(p, txt) for p in KIT_PATTERNS)
 
-
-def parse_money(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    s = str(value).strip()
-    if not s:
-        return None
-    s_low = s.lower()
-    if "free" in s_low or "gratis" in s_low or "grátis" in s_low:
-        return 0.0
-    cleaned = re.sub(r"[^0-9,.\-]", "", s)
-    if not cleaned:
-        return None
-    if "," in cleaned and "." in cleaned:
-        if cleaned.rfind(",") > cleaned.rfind("."):
-            cleaned = cleaned.replace(".", "").replace(",", ".")
-        else:
-            cleaned = cleaned.replace(",", "")
-    elif "," in cleaned:
-        cleaned = cleaned.replace(".", "").replace(",", ".")
+def parse_money(v):
+    if v is None: return None
+    if isinstance(v,(int,float)): return float(v)
+    s = str(v).strip()
+    if not s: return None
+    sl = s.lower()
+    if "free" in sl or "gratis" in sl: return 0.0
+    c = re.sub(r"[^0-9,.\-]","",s)
+    if not c: return None
+    if "," in c and "." in c:
+        if c.rfind(",")>c.rfind("."): c=c.replace(".","").replace(",",".")
+        else: c=c.replace(",","")
+    elif "," in c:
+        c=c.replace(".","").replace(",",".")
     else:
-        if cleaned.count(".") > 1:
-            cleaned = cleaned.replace(".", "")
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
+        if c.count(".")>1: c=c.replace(".","")
+    try: return float(c)
+    except ValueError: return None
 
-
-def money_br(value: Optional[float]) -> str:
-    if value is None:
-        return "nao visivel"
-    if value == 0.0:
-        return "Gratis"
-    s = f"{value:,.2f}"
-    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
+def money_br(v):
+    if v is None: return "nao visivel"
+    if v==0.0: return "Gratis"
+    s=f"{v:,.2f}".replace(",","X").replace(".",",").replace("X",".")
     return f"R$ {s}"
 
+def host_from_url(url):
+    if not url: return ""
+    try: return urlparse(url).netloc.lower()
+    except: return ""
 
-def host_from_url(url: Optional[str]) -> str:
-    if not url:
-        return ""
-    try:
-        return urlparse(url).netloc.lower()
-    except Exception:
-        return ""
-
-
-def marketplace_from_url(url: Optional[str], source: Optional[str] = None) -> str:
+def marketplace_from_url(url, source=None):
     host = host_from_url(url)
-    source_norm = normalize_text(source)
-    if "mercadolivre" in host or "mercadolibre" in host or "mercado livre" in source_norm:
-        return "Mercado Livre"
-    if "amazon" in host or "amazon" in source_norm:
-        return "Amazon"
-    if "shopee" in host or "shopee" in source_norm:
-        return "Shopee"
-    if "magazineluiza" in host or "magalu" in host or "magalu" in source_norm:
-        return "Magalu"
-    if "americanas" in host or "americanas" in source_norm:
-        return "Americanas"
-    if "casasbahia" in host or "casas bahia" in source_norm:
-        return "Casas Bahia"
-    if "carrefour" in host or "carrefour" in source_norm:
-        return "Carrefour"
-    if "submarino" in host or "submarino" in source_norm:
-        return "Submarino"
-    if "extra.com" in host or "extra" in source_norm:
-        return "Extra"
-    if "kabum" in host or "kabum" in source_norm:
-        return "KaBuM"
-    if source and str(source).strip():
-        return str(source).strip()
+    sn = normalize_text(source)
+    if "mercadolivre" in host or "mercadolibre" in host or "mercado livre" in sn: return "Mercado Livre"
+    if "amazon" in host or "amazon" in sn: return "Amazon"
+    if "shopee" in host or "shopee" in sn: return "Shopee"
+    if "magazineluiza" in host or "magalu" in host or "magalu" in sn: return "Magalu"
+    if "americanas" in host or "americanas" in sn: return "Americanas"
+    if "casasbahia" in host or "casas bahia" in sn: return "Casas Bahia"
+    if "carrefour" in host or "carrefour" in sn: return "Carrefour"
+    if "submarino" in host or "submarino" in sn: return "Submarino"
+    if "extra.com" in host or "extra" in sn: return "Extra"
+    if "kabum" in host or "kabum" in sn: return "KaBuM"
+    if source and str(source).strip(): return str(source).strip()
     return host or "nao visivel"
 
-
-def infer_seller(store_name: Optional[str], source: Optional[str], url: Optional[str]) -> str:
-    if store_name and str(store_name).strip():
-        return str(store_name).strip()
-    if source and str(source).strip():
-        return str(source).strip()
+def infer_seller(store_name, source, url):
+    if store_name and str(store_name).strip(): return str(store_name).strip()
+    if source and str(source).strip(): return str(source).strip()
     host = host_from_url(url)
     if host:
-        name = re.sub(r"^www\.", "", host)
-        name = re.sub(r"\.(com\.br|com|br|net|org)$", "", name)
-        return name.capitalize() if name else "nao visivel"
+        n=re.sub(r"^www\.","",host)
+        n=re.sub(r"\.(com\.br|com|br|net|org)$","",n)
+        return n.capitalize() if n else "nao visivel"
     return "nao visivel"
 
 
-# ── Fetchers ──────────────────────────────────────────────────────────────────
+# --- fetcher ---
 
-def requests_get_text(url: str) -> Optional[str]:
+def requests_get_text(url):
     try:
-        response = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT, allow_redirects=True)
-        response.raise_for_status()
-        return response.text
-    except Exception as exc:
-        logger.warning("Falha ao obter HTML %s: %s", url, exc)
+        r = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        logger.warning("Falha HTML %s: %s", url, e)
         return None
 
 
-# ── GTIN extraction ───────────────────────────────────────────────────────────
+# --- gtin extraction ---
 
-def collect_gtins_from_json(obj: Any, out: Set[str]) -> None:
+def collect_gtins_from_json(obj, out):
     if isinstance(obj, dict):
-        for key, value in obj.items():
-            key_norm = str(key).strip().lower()
-            if key_norm in GTIN_KEYS:
-                if isinstance(value, list):
-                    for item in value:
-                        d = digits_only(str(item))
-                        if d:
-                            out.add(d)
-                else:
-                    d = digits_only(str(value))
-                    if d:
-                        out.add(d)
+        for k,v in obj.items():
+            kn=str(k).strip().lower()
+            if kn in GTIN_KEYS:
+                items = v if isinstance(v,list) else [v]
+                for i in items:
+                    d=digits_only(str(i))
+                    if d: out.add(d)
             else:
-                collect_gtins_from_json(value, out)
+                collect_gtins_from_json(v, out)
     elif isinstance(obj, list):
-        for item in obj:
-            collect_gtins_from_json(item, out)
+        for i in obj: collect_gtins_from_json(i, out)
 
-
-def extract_gtins_from_html(html: str) -> Set[str]:
-    found: Set[str] = set()
-    soup = BeautifulSoup(html or "", "html.parser")
-
-    # JSON-LD estruturado
-    for script in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
-        raw = (script.string or script.get_text() or "").strip()
-        if not raw:
-            continue
+def extract_gtins_from_html(html):
+    found=set()
+    soup=BeautifulSoup(html or "","html.parser")
+    for script in soup.find_all("script", attrs={"type":re.compile(r"ld\+json",re.I)}):
+        raw=(script.string or script.get_text() or "").strip()
+        if not raw: continue
         try:
-            data = json.loads(raw)
-            collect_gtins_from_json(data, found)
-        except Exception:
-            for match in re.finditer(
-                r'"(?:gtin|gtin8|gtin12|gtin13|gtin14|ean)"\s*:\s*"(\d{8,14})"', raw, flags=re.I
-            ):
-                found.add(match.group(1))
-
-    # Microdados / itemprop
+            collect_gtins_from_json(json.loads(raw), found)
+        except:
+            for m in re.finditer(r'"(?:gtin\d*|ean)"\s*:\s*"(\d{8,14})"',raw,re.I):
+                found.add(m.group(1))
     for tag in soup.select("[itemprop]"):
-        itemprop = (tag.get("itemprop") or "").strip().lower()
-        if itemprop in GTIN_KEYS:
-            value = tag.get("content") or tag.get_text(" ", strip=True)
-            d = digits_only(value)
-            if d:
-                found.add(d)
-
-    # Regex genérico no HTML bruto
-    for match in re.finditer(
-        r'(?:gtin|gtin8|gtin12|gtin13|gtin14|ean)[^0-9]{0,25}(\d{8,14})', html, flags=re.I
-    ):
-        found.add(match.group(1))
-
-    # Atributos data-ean / data-gtin (comum em lojas BR)
-    for tag in soup.find_all(True):
-        for attr, val in tag.attrs.items():
-            if "ean" in attr.lower() or "gtin" in attr.lower():
-                d = digits_only(str(val))
-                if d and len(d) in (8, 12, 13, 14):
-                    found.add(d)
-
+        ip=(tag.get("itemprop") or "").strip().lower()
+        if ip in GTIN_KEYS:
+            d=digits_only(tag.get("content") or tag.get_text(" ",strip=True))
+            if d: found.add(d)
+    for m in re.finditer(r'(?:gtin\d*|ean)[^0-9]{0,25}(\d{8,14})',html,re.I):
+        found.add(m.group(1))
     return found
 
 
-# ── Base reference ────────────────────────────────────────────────────────────
+# --- product meta extraction (NOVO) ---
 
-def fetch_base_reference(entry: EntryInput) -> Dict[str, Any]:
-    ean = entry.ean
-    url = entry.base_url
-    notes: List[str] = []
+def _extract_schema_product(obj, meta):
+    if isinstance(obj, list):
+        for i in obj: _extract_schema_product(i, meta)
+        return
+    if not isinstance(obj, dict): return
+    typ=str(obj.get("@type","")).lower()
+    if "product" in typ:
+        if not meta.get("title") and obj.get("name"):
+            meta["title"]=str(obj["name"]).strip()
+        if not meta.get("brand"):
+            br=obj.get("brand")
+            if isinstance(br,dict): b=br.get("name") or br.get("@name") or ""
+            elif isinstance(br,str): b=br
+            else: b=""
+            if b and b.strip(): meta["brand"]=b.strip()
+        if not meta.get("model") and obj.get("model"):
+            meta["model"]=str(obj["model"]).strip()
+        if not meta.get("mpn") and obj.get("mpn"):
+            meta["mpn"]=str(obj["mpn"]).strip()
+        if not meta.get("category"):
+            cat=obj.get("category")
+            if cat: meta["category"]=(cat[0] if isinstance(cat,list) else str(cat)).strip()
+    skip={"@context","@type","gtin","gtin8","gtin12","gtin13","gtin14","ean","isbn"}
+    for k,v in obj.items():
+        if k in skip: continue
+        if isinstance(v,(dict,list)): _extract_schema_product(v, meta)
 
-    html = requests_get_text(url)
-    html_gtins = extract_gtins_from_html(html or "") if html else set()
+def _meta_content(soup, *attrs):
+    for a in attrs:
+        tag=soup.find("meta",property=a) or soup.find("meta",attrs={"name":a})
+        if tag:
+            v=(tag.get("content") or "").strip()
+            if v: return v
+    return None
 
-    raw_title = None
-    if html:
-        soup = BeautifulSoup(html, "html.parser")
-        # Prioridade: og:title → h1 → <title>
-        og = soup.find("meta", property="og:title")
-        if og and og.get("content"):
-            raw_title = og["content"].strip()
-        else:
-            h1 = soup.find("h1")
-            if h1:
-                raw_title = h1.get_text(" ", strip=True)
-            elif soup.title:
-                raw_title = soup.title.get_text(" ", strip=True)
+def extract_product_meta(html):
+    """
+    Extrai titulo, marca, modelo, MPN e categoria do HTML de uma pagina de produto.
+    Fontes (em prioridade): JSON-LD schema.org > meta OG/product > itemprop > <title>
+    """
+    meta={"title":None,"brand":None,"model":None,"mpn":None,"category":None}
+    soup=BeautifulSoup(html or "","html.parser")
 
-    # Remove ruído de sufixo de loja do título
-    title = clean_store_title(raw_title) if raw_title else None
+    # 1. JSON-LD
+    for script in soup.find_all("script",attrs={"type":re.compile(r"ld\+json",re.I)}):
+        raw=(script.string or script.get_text() or "").strip()
+        if not raw: continue
+        try:
+            _extract_schema_product(json.loads(raw), meta)
+        except:
+            for field,key in [("name","title"),("brand","brand"),("model","model"),("mpn","mpn")]:
+                if not meta[key]:
+                    m=re.search(rf'"{field}"\s*:\s*"([^"{{}}]+)"',raw,re.I)
+                    if m:
+                        v=m.group(1).strip()
+                        if v: meta[key]=v
 
-    gtins_found = sorted(html_gtins)
+    # 2. Meta tags OG / product
+    if not meta["title"]:
+        meta["title"]=_meta_content(soup,"og:title","twitter:title")
+    if not meta["brand"]:
+        meta["brand"]=_meta_content(soup,"product:brand","og:brand","brand")
 
+    # 3. itemprop
+    for ip,mk in [("name","title"),("brand","brand"),("model","model"),("mpn","mpn")]:
+        if meta[mk]: continue
+        tag=soup.find(attrs={"itemprop":ip})
+        if not tag: continue
+        if ip=="brand":
+            inner=tag.find(attrs={"itemprop":"name"})
+            if inner: tag=inner
+        v=(tag.get("content") or tag.get_text(" ",strip=True) or "").strip()
+        if v: meta[mk]=v
+
+    # 4. <title> fallback
+    if not meta["title"] and soup.title:
+        meta["title"]=soup.title.get_text(" ",strip=True)
+
+    return {k:(v.strip() if isinstance(v,str) and v.strip() else None) for k,v in meta.items()}
+
+
+# --- base reference ---
+
+def fetch_base_reference(entry):
+    """
+    Acessa a URL de referencia e extrai: GTINs, titulo, marca, modelo, MPN e categoria.
+    Esses dados enriquecem as queries de busca e a validacao cruzada dos candidatos.
+    """
+    ean=entry.ean; url=entry.base_url; notes=[]
+    html=requests_get_text(url)
+    html_gtins=extract_gtins_from_html(html or "") if html else set()
+    meta=extract_product_meta(html) if html else {}
+    title=meta.get("title"); brand=meta.get("brand")
+    model=meta.get("model"); mpn=meta.get("mpn"); category=meta.get("category")
+    gtins_found=sorted(html_gtins)
     if gtins_found:
         if ean in gtins_found:
-            notes.append("GTIN/EAN confirmado na URL de referencia")
-            base_status = "BASE CONFIRMADA"
+            notes.append("GTIN/EAN confirmado na URL de referencia"); base_status="BASE CONFIRMADA"
         else:
-            notes.append(f"GTIN/EAN divergente: encontrados {', '.join(gtins_found[:5])}")
-            base_status = "BASE COM DIVERGENCIA"
+            notes.append(f"GTIN/EAN divergente: encontrados {', '.join(gtins_found[:5])}"); base_status="BASE COM DIVERGENCIA"
     else:
-        notes.append("GTIN/EAN nao visivel na URL de referencia")
-        base_status = "BASE SEM GTIN VISIVEL"
-
-    if looks_like_kit_or_combo(title):
-        notes.append("URL de referencia parece kit/combo")
-
+        notes.append("GTIN/EAN nao visivel na URL de referencia"); base_status="BASE SEM GTIN VISIVEL"
+    if looks_like_kit_or_combo(title): notes.append("URL de referencia parece kit/combo")
+    if brand: notes.append(f"Marca extraida: {brand}")
+    if model: notes.append(f"Modelo extraido: {model}")
+    if mpn:   notes.append(f"MPN extraido: {mpn}")
     return {
-        "ean_input": ean,
-        "base_url": url,
-        "base_title": title or "nao visivel",
-        "base_status": base_status,
-        "base_notes": " | ".join(notes),
-        "_gtins_set": set(gtins_found),
+        "ean_input":ean,"base_url":url,
+        "base_title":title or "nao visivel",
+        "base_brand":brand,"base_model":model,"base_mpn":mpn,"base_category":category,
+        "base_status":base_status,"base_notes":" | ".join(notes),
+        "_gtins_set":set(gtins_found),
     }
 
 
-# ── Validação de oferta ───────────────────────────────────────────────────────
+# --- validacao ---
 
-def validate_offer(ref: Dict[str, Any], title: Optional[str], url: Optional[str]) -> Dict[str, Any]:
+def validate_offer(ref, title, url):
     """
-    Hierarquia de decisão:
+    Valida candidato contra o EAN de referencia.
 
-    1. Kit/combo no título                       → EXCLUIDO         ❌ descartado
-    2. GTIN exato confirmado via scraping        → EXATO            ✅ aceito
-    3. GTIN diferente encontrado via scraping    → DIVERGENTE       ❌ descartado
-    4. Scraping sem resultado (bloqueado/sem GTIN publicado):
-       a. key_overlap ≥ 0.60 E jaccard ≥ 0.35   → PROVAVEL_TITULO  ✅ aceito
-       b. Qualquer outro caso                    → NAO_CONFIRMADO   ❌ descartado
+    1. Kit/combo                               -> EXCLUIDO
+    2. GTIN exato via scraping                 -> EXATO
+    3. GTIN diferente via scraping             -> DIVERGENTE
+    4a. Marca conhecida ausente no candidato   -> DIVERGENTE  (NOVO)
+    4b. Score enriquecido >= 0.72              -> PROVAVEL
+    4c. Score 0.45-0.71                        -> NAO CONFIRMADO
+    4d. Demais                                 -> DIVERGENTE
 
-    Lógica do critério 4a:
-    - key_overlap mede presença de tokens discriminativos (número de modelo, capacidade).
-      Ex: "Galaxy A55 128GB" vs "Galaxy A55 256GB" → key_overlap baixo (128 ≠ 256) → REJEITADO.
-    - Exige AMBOS os critérios para minimizar falsos positivos.
-    - Ser mais permissivo aqui traria de volta o problema original de produtos errados.
+    Score enriquecido = Jaccard(titulo)
+                      + 0.10 se marca da ref aparece no candidato  (NOVO)
+                      + 0.15 se modelo/MPN da ref aparece no candidato  (NOVO)
     """
-    notes: List[str] = []
-
-    # 1. Kit/combo
+    notes=[]
     if looks_like_kit_or_combo(title):
-        return {
-            "status": "EXCLUIDO - KIT/COMBO",
-            "kit_combo_detectado": True,
-            "notes": ["kit/combo detectado no titulo"],
-            "combined_score": 0.0,
-        }
+        return {"status":"EXCLUIDO - KIT/COMBO","kit_combo_detectado":True,"notes":["kit/combo no titulo"],"combined_score":0.0}
 
-    # 2 & 3. Tenta confirmar via GTIN na página do candidato
-    gtins: Set[str] = set()
-    scraping_attempted = False
-    if url and url != "nao visivel":
-        scraping_attempted = True
-        html = requests_get_text(url)
-        if html:
-            gtins = extract_gtins_from_html(html)
+    gtins=set()
+    if url and url!="nao visivel":
+        html=requests_get_text(url)
+        if html: gtins=extract_gtins_from_html(html)
+
+    base_brand=ref.get("base_brand"); base_model=ref.get("base_model") or ref.get("base_mpn")
+    title_norm=normalize_text(title or "")
+    similarity=token_similarity(title, ref.get("base_title"))
+    brand_match=bool(base_brand and normalize_text(base_brand) in title_norm)
+    model_match=bool(base_model and normalize_text(base_model) in title_norm)
+    combined=round(min(1.0, similarity + (0.10 if brand_match else 0) + (0.15 if model_match else 0)), 4)
 
     if gtins:
         if ref["ean_input"] in gtins:
-            notes.append("GTIN exato confirmado na pagina")
-            return {
-                "status": "EXATO",
-                "kit_combo_detectado": False,
-                "notes": notes,
-                "combined_score": 1.0,
-            }
-        # GTIN presente mas diferente → produto claramente errado
-        notes.append(f"GTIN divergente na pagina: {', '.join(sorted(gtins)[:3])}")
-        return {
-            "status": "DIVERGENTE",
-            "kit_combo_detectado": False,
-            "notes": notes,
-            "combined_score": 0.0,
-        }
+            return {"status":"EXATO","kit_combo_detectado":False,"notes":["GTIN exato confirmado"],"combined_score":1.0}
+        notes.append(f"GTIN divergente: {', '.join(sorted(gtins)[:3])}")
+        return {"status":"DIVERGENTE","kit_combo_detectado":False,"notes":notes,"combined_score":0.0}
 
-    # 4. Sem GTIN encontrado — valida por título
-    jaccard, key_overlap = title_match_score(title, ref.get("base_title"))
-    scraping_note = "scraping sem GTIN" if scraping_attempted else "sem URL para scraping"
-    notes.append(f"{scraping_note} — jaccard={jaccard:.2f} key_overlap={key_overlap:.2f}")
+    # 4a. Marca conhecida ausente no candidato
+    if base_brand and not brand_match and combined < 0.80:
+        notes.append(f"Marca '{base_brand}' ausente no candidato (score={combined:.2f})")
+        return {"status":"DIVERGENTE","kit_combo_detectado":False,"notes":notes,"combined_score":0.0}
 
-    if key_overlap >= 0.60 and jaccard >= 0.35:
-        combined = round(key_overlap * 0.7 + jaccard * 0.3, 4)
-        return {
-            "status": "PROVAVEL_TITULO",
-            "kit_combo_detectado": False,
-            "notes": notes,
-            "combined_score": combined,
-        }
-
-    return {
-        "status": "NAO_CONFIRMADO",
-        "kit_combo_detectado": False,
-        "notes": notes,
-        "combined_score": 0.0,
-    }
+    if combined >= 0.72:
+        boosts=[f"marca '{base_brand}'" if brand_match else None, f"modelo '{base_model}'" if model_match else None]
+        detail=" | confirmados: "+", ".join(b for b in boosts if b) if any(boosts) else ""
+        notes.append(f"Validacao titulo/marca/modelo (score={combined:.2f}){detail}")
+        return {"status":"PROVAVEL","kit_combo_detectado":False,"notes":notes,"combined_score":combined}
+    if combined >= 0.45:
+        notes.append(f"Similaridade insuficiente ({combined:.2f})")
+        return {"status":"NAO CONFIRMADO","kit_combo_detectado":False,"notes":notes,"combined_score":0.0}
+    return {"status":"DIVERGENTE","kit_combo_detectado":False,"notes":[f"baixa aderencia ({combined:.2f})"],"combined_score":0.0}
 
 
-def relevance_score(
-    position: Optional[int],
-    reviews: Optional[int],
-    rating: Optional[float],
-    multiple_sources: bool,
-    validation_boost: float = 0.0,
-) -> float:
-    score = 0.0
-    if position is not None:
-        score += max(0.0, 40.0 - (position * 3.0))
-    if reviews is not None:
-        score += min(30.0, math.log10(reviews + 1) * 10.0)
-    if rating is not None:
-        score += rating * 6.0
-    if multiple_sources:
-        score += 8.0
-    score += validation_boost * 20
-    return round(score, 2)
+def relevance_score(position, reviews, rating, multiple_sources, validation_boost=0.0):
+    score=0.0
+    if position is not None: score+=max(0.0, 40.0-(position*3.0))
+    if reviews is not None:  score+=min(30.0, math.log10(reviews+1)*10.0)
+    if rating is not None:   score+=rating*6.0
+    if multiple_sources:     score+=8.0
+    score+=validation_boost*20
+    return round(score,2)
 
-
-def relevance_label(score: float, reviews: Optional[int], position: Optional[int]) -> str:
-    if score >= 55 or (position is not None and position <= 3) or (reviews is not None and reviews >= 100):
-        return "ALTA"
-    if score >= 35:
-        return "MEDIA"
+def relevance_label(score, reviews, position):
+    if score>=55 or (position is not None and position<=3) or (reviews is not None and reviews>=100): return "ALTA"
+    if score>=35: return "MEDIA"
     return "BAIXA"
 
 
-# ── SerpApi ───────────────────────────────────────────────────────────────────
+# --- serpapi ---
 
-def serpapi_request(params: Dict[str, Any]) -> Dict[str, Any]:
-    if not SERPAPI_KEY:
-        raise ExternalAPIError("SERPAPI_KEY nao configurada no Render.")
-    payload = dict(params)
-    payload["api_key"] = SERPAPI_KEY
+def serpapi_request(params):
+    if not SERPAPI_KEY: raise ExternalAPIError("SERPAPI_KEY nao configurada.")
+    pl=dict(params); pl["api_key"]=SERPAPI_KEY
     try:
-        response = requests.get(SERPAPI_ENDPOINT, params=payload, headers=HEADERS, timeout=HTTP_TIMEOUT)
-    except requests.RequestException as exc:
-        raise ExternalAPIError(f"Falha de conexao com a SerpApi: {exc}") from exc
-
-    preview = response.text[:500] if response.text else ""
-    if response.status_code >= 400:
-        try:
-            data = response.json()
-            message = data.get("error") or data.get("message") or preview
-        except Exception:
-            message = preview or f"HTTP {response.status_code}"
-        raise ExternalAPIError(f"SerpApi HTTP {response.status_code}: {message}")
-
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise ExternalAPIError(f"Resposta invalida da SerpApi: {preview}") from exc
-
-    status = ((data.get("search_metadata") or {}).get("status") or "").lower()
-    if data.get("error"):
-        raise ExternalAPIError(f"SerpApi retornou erro: {data['error']}")
-    if status == "error":
-        raise ExternalAPIError(f"SerpApi search_metadata.status=Error: {preview}")
+        r=requests.get(SERPAPI_ENDPOINT,params=pl,headers=HEADERS,timeout=HTTP_TIMEOUT)
+    except requests.RequestException as e:
+        raise ExternalAPIError(f"Falha SerpApi: {e}") from e
+    preview=r.text[:500] if r.text else ""
+    if r.status_code>=400:
+        try: msg=r.json().get("error") or preview
+        except: msg=preview
+        raise ExternalAPIError(f"SerpApi HTTP {r.status_code}: {msg}")
+    try: data=r.json()
+    except ValueError as e: raise ExternalAPIError(f"Resposta invalida: {preview}") from e
+    if data.get("error"): raise ExternalAPIError(f"SerpApi erro: {data['error']}")
+    if ((data.get("search_metadata") or {}).get("status") or "").lower()=="error":
+        raise ExternalAPIError(f"SerpApi status=Error: {preview}")
     return data
 
+def is_no_results_error(msg):
+    m=(msg or "").lower()
+    return "hasn't returned any results" in m or "returned any results for this query" in m
 
-def is_no_results_error(message: str) -> bool:
-    msg = (message or "").lower()
-    return "hasn't returned any results" in msg or "returned any results for this query" in msg
 
-
-def build_search_queries(ref: Dict[str, Any]) -> List[str]:
+def build_search_queries(ref):
     """
-    Estratégia de busca em 3 camadas — da mais precisa à mais ampla:
+    Constroi queries cruzando EAN + Marca + Modelo para maxima precisao.
 
-    1. Título limpo + EAN  → melhor cobertura: Google Shopping BR indexa bem por título
-    2. Só o EAN            → fallback quando título não retorna resultados
-    3. Só o título         → último recurso; produtos validados depois pelo GTIN via scraping
-
-    NÃO usamos EAN entre aspas duplas como query primária porque o Google Shopping BR
-    frequentemente retorna zero resultados para EAN isolado com aspas.
+    1. "EAN" marca modelo tokens_titulo   <- mais discriminante
+    2. "EAN" marca modelo
+    3. "EAN"
+    4. marca modelo tokens_titulo          <- fallback textual sem EAN
     """
-    ean = ref["ean_input"]
-    title = ref["base_title"] if ref["base_title"] != "nao visivel" else ""
-    title_tokens = [t for t in tokenize(title) if len(t) > 2]
-    short_title = " ".join(list(title_tokens)[:7])
+    ean=ref["ean_input"]
+    title=ref["base_title"] if ref["base_title"]!="nao visivel" else ""
+    brand=(ref.get("base_brand") or "").strip()
+    model=(ref.get("base_model") or ref.get("base_mpn") or "").strip()
 
-    candidates: List[Optional[str]] = []
+    brand_tok=set(tokenize(brand)); model_tok=set(tokenize(model))
+    title_tokens=[t for t in tokenize(title) if len(t)>2 and t not in brand_tok and t not in model_tok]
 
-    if short_title:
-        candidates.append(f"{short_title} {ean}")   # primária: título + EAN
-        candidates.append(ean)                       # fallback 1: só EAN
-        candidates.append(short_title)               # fallback 2: só título
-    else:
-        candidates.append(ean)
+    ctx_parts=[]
+    if brand: ctx_parts.append(brand)
+    if model: ctx_parts.append(model)
+    context=" ".join(ctx_parts).strip()
+    if not context: context=" ".join(title_tokens[:5])
 
-    out: List[str] = []
-    seen: set = set()
+    extra=" ".join(title_tokens[:3])
+    full_context=(context+" "+extra).strip() if extra else context
+
+    short_title=" ".join(list(tokenize(title))[:6]) if title else ""
+
+    candidates=[
+        f'"{ean}" {full_context}'.strip() if full_context else f'"{ean}"',
+        f'"{ean}" {context}'.strip() if context and context!=full_context else None,
+        f'"{ean}"',
+        full_context if full_context else (short_title or None),
+    ]
+    out=[]; seen=set()
     for item in candidates:
-        if not item:
-            continue
-        item = re.sub(r"\s+", " ", item).strip()
-        if item and item not in seen:
-            out.append(item)
-            seen.add(item)
-    return out or [ean]
+        if not item: continue
+        item=re.sub(r"\s+"," ",item).strip()
+        if item and item not in seen: out.append(item); seen.add(item)
+    return out or [f'"{ean}"']
 
 
-def shopping_search(ref: Dict[str, Any], gl: str, hl: str, location: str) -> Dict[str, Any]:
-    last_error: Optional[str] = None
-    queries = build_search_queries(ref)
-    for query in queries:
+def shopping_search(ref, gl, hl, location):
+    last_error=None
+    for query in build_search_queries(ref):
         try:
-            data = serpapi_request({
-                "engine": "google_shopping",
-                "q": query,
-                "gl": gl,
-                "hl": hl,
-                "location": location,
-                "no_cache": "true",
-            })
+            data=serpapi_request({"engine":"google_shopping","q":query,"gl":gl,"hl":hl,"location":location,"no_cache":"true"})
             if data.get("shopping_results"):
-                data["_query_used"] = query
-                logger.info("EAN %s — query usada: %s", ref["ean_input"], query)
-                return data
-            last_error = "Google Shopping nao retornou resultados."
-        except ExternalAPIError as exc:
-            last_error = str(exc)
-            if is_no_results_error(last_error):
-                continue
+                data["_query_used"]=query; return data
+            last_error="Google Shopping sem resultados."
+        except ExternalAPIError as e:
+            last_error=str(e)
+            if is_no_results_error(last_error): continue
             raise
-    return {"shopping_results": [], "_query_used": None, "_notes": [last_error or "Sem resultados."]}
+    return {"shopping_results":[],"_query_used":None,"_notes":[last_error or "Sem resultados."]}
 
 
-def immersive_product(
-    page_token: str, gl: str, hl: str, location: str, next_page_token: Optional[str] = None
-) -> Dict[str, Any]:
-    params: Dict[str, Any] = {
-        "engine": "google_immersive_product",
-        "gl": gl,
-        "hl": hl,
-        "location": location,
-        "no_cache": "true",
-        "more_stores": "true",
-    }
-    if next_page_token:
-        params["next_page_token"] = next_page_token
-    else:
-        params["page_token"] = page_token
+def immersive_product(page_token, gl, hl, location, next_page_token=None):
+    params={"engine":"google_immersive_product","gl":gl,"hl":hl,"location":location,"no_cache":"true","more_stores":"true"}
+    if next_page_token: params["next_page_token"]=next_page_token
+    else: params["page_token"]=page_token
     return serpapi_request(params)
 
 
-# ── Build top 10 Google Shopping ─────────────────────────────────────────────
+# --- build top10 ---
 
-def build_google_top10(
-    ref: Dict[str, Any], gl: str, hl: str, location: str, max_products_per_entry: int
-) -> List[Dict[str, Any]]:
-    search_data = shopping_search(ref, gl, hl, location)
-    shopping_results = search_data.get("shopping_results", []) or []
+def build_google_top10(ref, gl, hl, location, max_products_per_entry):
+    search_data=shopping_search(ref,gl,hl,location)
+    shopping_results=search_data.get("shopping_results",[]) or []
+    all_rows=[]; seen=set()
+    if not shopping_results: return []
 
-    all_rows: List[Dict[str, Any]] = []
-    seen: Set[str] = set()
+    for search_rank, result in enumerate(shopping_results[:max_products_per_entry],start=1):
+        ct=result.get("title"); cp=result.get("position") or search_rank
+        cs=result.get("source"); cl=result.get("product_link")
+        cms=bool(result.get("multiple_sources"))
+        cpn=result.get("extracted_price") or parse_money(result.get("price"))
+        cdn=parse_money(result.get("delivery"))
+        ctn=(cpn+cdn if cpn is not None and cdn is not None else cpn)
+        pt=result.get("immersive_product_page_token"); created=False
 
-    if not shopping_results:
-        return []
-
-    for search_rank, result in enumerate(shopping_results[:max_products_per_entry], start=1):
-        candidate_title    = result.get("title")
-        candidate_position = result.get("position") or search_rank
-        candidate_source   = result.get("source")
-        candidate_product_link     = result.get("product_link")
-        candidate_multiple_sources = bool(result.get("multiple_sources"))
-        candidate_price_num    = result.get("extracted_price") or parse_money(result.get("price"))
-        candidate_delivery_num = parse_money(result.get("delivery"))
-        candidate_total_num = (
-            candidate_price_num + candidate_delivery_num
-            if candidate_price_num is not None and candidate_delivery_num is not None
-            else candidate_price_num
-        )
-        page_token = result.get("immersive_product_page_token")
-        product_rows_created = False
-
-        if page_token:
-            next_page_token = None
-            pages_collected = 0
-            while pages_collected < 2:
+        if pt:
+            npt=None; pages=0
+            while pages<2:
                 try:
-                    product_data = immersive_product(
-                        page_token=page_token, gl=gl, hl=hl, location=location,
-                        next_page_token=next_page_token,
-                    )
-                except ExternalAPIError as exc:
-                    logger.warning("Falha no immersive product para %s: %s", ref["ean_input"], exc)
-                    break
-
-                product_results = product_data.get("product_results", {}) or {}
-                stores = product_results.get("stores", []) or []
-
-                for store in stores:
-                    store_link  = store.get("link")
-                    store_title = store.get("title") or candidate_title
-                    validation  = validate_offer(ref, store_title, store_link)
-
-                    if validation["kit_combo_detectado"]:
-                        continue
-                    if validation["status"] not in ACCEPTED_STATUSES:
-                        logger.debug(
-                            "Descartado store status=%s ean=%s titulo=%s",
-                            validation["status"], ref["ean_input"], store_title,
-                        )
-                        continue
-
-                    reviews = store.get("reviews")
-                    rating  = store.get("rating")
-                    combined_score = float(validation.get("combined_score") or 0.0)
-                    score = relevance_score(
-                        candidate_position, reviews, rating, candidate_multiple_sources, combined_score
-                    )
-
-                    price_num = store.get("extracted_price") or parse_money(store.get("price"))
-                    ship_num  = store.get("shipping_extracted")
-                    if ship_num is None:
-                        ship_num = parse_money(store.get("shipping"))
-                    total_num = (
-                        (price_num + ship_num)
-                        if price_num is not None and ship_num is not None
-                        else price_num
-                    )
-                    frete_gratis = ship_num == 0.0
-
-                    row = {
-                        "ean": ref["ean_input"],
-                        "ranking": 0,
-                        "seller": infer_seller(store.get("name"), candidate_source, store_link),
-                        "marketplace": marketplace_from_url(store_link, candidate_source),
-                        "produto": store_title or "nao visivel",
-                        "preco_produto": money_br(price_num),
-                        "frete_gratis": "Sim" if frete_gratis else "Nao",
-                        "preco_total": money_br(total_num),
-                        "link": store_link or candidate_product_link or "nao visivel",
-                        "status_validacao": validation["status"],
-                        "relevancia": relevance_label(score, reviews, candidate_position),
-                        "_score": score,
-                        "_price_num": total_num,
+                    pd=immersive_product(page_token=pt,gl=gl,hl=hl,location=location,next_page_token=npt)
+                except ExternalAPIError as e:
+                    logger.warning("Immersive fail %s: %s",ref["ean_input"],e); break
+                pr=pd.get("product_results",{}) or {}
+                for store in (pr.get("stores",[]) or []):
+                    sl=store.get("link")
+                    v=validate_offer(ref, store.get("title") or ct, sl)
+                    if v["kit_combo_detectado"] or v["status"] not in ACCEPTED_STATUSES:
+                        logger.debug("Descartado status=%s ean=%s",v["status"],ref["ean_input"]); continue
+                    rev=store.get("reviews"); rat=store.get("rating")
+                    sc=relevance_score(cp,rev,rat,cms,float(v.get("combined_score") or 0))
+                    pn=store.get("extracted_price") or parse_money(store.get("price"))
+                    shn=store.get("shipping_extracted") or parse_money(store.get("shipping"))
+                    tn=(pn+shn if pn is not None and shn is not None else pn)
+                    row={
+                        "ean":ref["ean_input"],"ranking":0,
+                        "seller":infer_seller(store.get("name"),cs,sl),
+                        "marketplace":marketplace_from_url(sl,cs),
+                        "produto":store.get("title") or ct or "nao visivel",
+                        "preco_produto":money_br(pn),"frete_gratis":"Sim" if shn==0.0 else "Nao",
+                        "preco_total":money_br(tn),"link":sl or cl or "nao visivel",
+                        "status_validacao":v["status"],
+                        "relevancia":relevance_label(sc,rev,cp),
+                        "_score":sc,"_price_num":tn,
                     }
-                    key = f'{row["ean"]}|{row["link"]}|{row["seller"]}'
-                    if key not in seen:
-                        seen.add(key)
-                        all_rows.append(row)
-                        product_rows_created = True
+                    key=f'{row["ean"]}|{row["link"]}|{row["seller"]}'
+                    if key not in seen: seen.add(key); all_rows.append(row); created=True
+                npt=pr.get("stores_next_page_token"); pages+=1
+                if not npt: break
 
-                next_page_token = product_results.get("stores_next_page_token")
-                pages_collected += 1
-                if not next_page_token:
-                    break
-
-        # Fallback: sem immersive, ou todas as stores do immersive foram descartadas
-        if not product_rows_created:
-            validation = validate_offer(ref, candidate_title, candidate_product_link)
-
-            if validation["kit_combo_detectado"]:
-                continue
-            if validation["status"] not in ACCEPTED_STATUSES:
-                logger.debug(
-                    "Descartado fallback status=%s ean=%s titulo=%s",
-                    validation["status"], ref["ean_input"], candidate_title,
-                )
-                continue
-
-            reviews = result.get("reviews")
-            rating  = result.get("rating")
-            combined_score = float(validation.get("combined_score") or 0.0)
-            score = relevance_score(
-                candidate_position, reviews, rating, candidate_multiple_sources, combined_score
-            )
-            frete_gratis = candidate_delivery_num == 0.0
-
-            row = {
-                "ean": ref["ean_input"],
-                "ranking": 0,
-                "seller": infer_seller(None, candidate_source, candidate_product_link),
-                "marketplace": marketplace_from_url(candidate_product_link, candidate_source),
-                "produto": candidate_title or "nao visivel",
-                "preco_produto": money_br(candidate_price_num),
-                "frete_gratis": "Sim" if frete_gratis else "Nao",
-                "preco_total": money_br(candidate_total_num),
-                "link": candidate_product_link or "nao visivel",
-                "status_validacao": validation["status"],
-                "relevancia": relevance_label(score, reviews, candidate_position),
-                "_score": score,
-                "_price_num": candidate_total_num,
+        if not created:
+            v=validate_offer(ref,ct,cl)
+            if v["kit_combo_detectado"] or v["status"] not in ACCEPTED_STATUSES:
+                logger.debug("Descartado fallback status=%s ean=%s",v["status"],ref["ean_input"]); continue
+            rev=result.get("reviews"); rat=result.get("rating")
+            sc=relevance_score(cp,rev,rat,cms,float(v.get("combined_score") or 0))
+            row={
+                "ean":ref["ean_input"],"ranking":0,
+                "seller":infer_seller(None,cs,cl),
+                "marketplace":marketplace_from_url(cl,cs),
+                "produto":ct or "nao visivel",
+                "preco_produto":money_br(cpn),"frete_gratis":"Sim" if cdn==0.0 else "Nao",
+                "preco_total":money_br(ctn),"link":cl or "nao visivel",
+                "status_validacao":v["status"],
+                "relevancia":relevance_label(sc,rev,cp),
+                "_score":sc,"_price_num":ctn,
             }
-            key = f'{row["ean"]}|{row["link"]}|{row["seller"]}'
-            if key not in seen:
-                seen.add(key)
-                all_rows.append(row)
+            key=f'{row["ean"]}|{row["link"]}|{row["seller"]}'
+            if key not in seen: seen.add(key); all_rows.append(row)
 
-    all_rows.sort(key=lambda x: (-x["_score"], x["_price_num"] or 10**9))
-
-    top10 = all_rows[:10]
-    for idx, row in enumerate(top10, start=1):
-        row["ranking"] = idx
-        row.pop("_score", None)
-        row.pop("_price_num", None)
-
+    all_rows.sort(key=lambda x:(-x["_score"],x["_price_num"] or 1e9))
+    top10=all_rows[:10]
+    for i,row in enumerate(top10,1):
+        row["ranking"]=i; row.pop("_score",None); row.pop("_price_num",None)
     return top10
 
 
-# ── Resumo competitivo ────────────────────────────────────────────────────────
+# --- resumo ---
 
-def percentile(values: List[float], p: float) -> Optional[float]:
-    if not values:
-        return None
-    if len(values) == 1:
-        return values[0]
-    values = sorted(values)
-    rank = (len(values) - 1) * (p / 100.0)
-    low  = math.floor(rank)
-    high = math.ceil(rank)
-    if low == high:
-        return values[low]
-    frac = rank - low
-    return values[low] + (values[high] - values[low]) * frac
+def percentile(values, p):
+    if not values: return None
+    if len(values)==1: return values[0]
+    values=sorted(values)
+    rank=(len(values)-1)*(p/100.0)
+    lo,hi=math.floor(rank),math.ceil(rank)
+    if lo==hi: return values[lo]
+    return values[lo]+(values[hi]-values[lo])*(rank-lo)
 
-
-def summarize_entry(ref: Dict[str, Any], top10: List[Dict[str, Any]]) -> Dict[str, Any]:
-    prices: List[float] = []
+def summarize_entry(ref, top10):
+    prices=[]
     for r in top10:
-        raw = r.get("preco_total", "")
-        if isinstance(raw, str):
-            num = parse_money(raw.replace("R$", "").replace(".", "").replace(",", ".").strip())
-        else:
-            num = parse_money(raw)
-        if num is not None and num > 0:
-            prices.append(num)
-
-    min_price = min(prices) if prices else None
-    max_price = max(prices) if prices else None
-    avg_price = statistics.mean(prices) if prices else None
-    p25 = percentile(prices, 25)
-    p45 = percentile(prices, 45)
-
-    com_frete_gratis = sum(1 for r in top10 if r.get("frete_gratis") == "Sim")
-    lider = top10[0] if top10 else None
-    faixa_ideal = (
-        f"{money_br(p25)} a {money_br(p45)}"
-        if p25 is not None and p45 is not None
-        else "nao visivel"
-    )
-
+        raw=r.get("preco_total","")
+        num=parse_money((raw.replace("R$","").replace(".","").replace(",",".").strip()) if isinstance(raw,str) else raw)
+        if num is not None and num>0: prices.append(num)
+    mn=min(prices) if prices else None
+    mx=max(prices) if prices else None
+    av=statistics.mean(prices) if prices else None
+    p25=percentile(prices,25); p45=percentile(prices,45)
+    lider=top10[0] if top10 else None
     return {
-        "ean": ref["ean_input"],
-        "base_url": ref["base_url"],
-        "base_title": ref["base_title"],
-        "base_status": ref["base_status"],
-        "menor_preco": money_br(min_price),
-        "preco_medio": money_br(avg_price),
-        "maior_preco": money_br(max_price),
-        "faixa_ideal_sugerida": faixa_ideal,
-        "vendedores_com_frete_gratis": com_frete_gratis,
-        "total_vendedores_top10": len(top10),
-        "seller_lider": lider["seller"] if lider else "nao visivel",
-        "marketplace_lider": lider["marketplace"] if lider else "nao visivel",
+        "ean":ref["ean_input"],"base_url":ref["base_url"],
+        "base_title":ref["base_title"],
+        "base_brand":ref.get("base_brand") or "nao visivel",
+        "base_model":ref.get("base_model") or "nao visivel",
+        "base_status":ref["base_status"],
+        "menor_preco":money_br(mn),"preco_medio":money_br(av),"maior_preco":money_br(mx),
+        "faixa_ideal_sugerida":(f"{money_br(p25)} a {money_br(p45)}" if p25 is not None and p45 is not None else "nao visivel"),
+        "vendedores_com_frete_gratis":sum(1 for r in top10 if r.get("frete_gratis")=="Sim"),
+        "total_vendedores_top10":len(top10),
+        "seller_lider":lider["seller"] if lider else "nao visivel",
+        "marketplace_lider":lider["marketplace"] if lider else "nao visivel",
     }
 
 
-# ── Processamento de uma entrada ──────────────────────────────────────────────
+# --- processo paralelo ---
 
-def process_entry(
-    entry: EntryInput, gl: str, hl: str, location: str, max_products_per_entry: int
-) -> Dict[str, Any]:
-    ref  = fetch_base_reference(entry)
-    top10 = build_google_top10(ref, gl, hl, location, max_products_per_entry)
-    summary = summarize_entry(ref, top10)
-    return {
-        "ean": entry.ean,
-        "summary": summary,
-        "top10": top10,
-    }
+def process_entry(entry, gl, hl, location, max_products_per_entry):
+    ref=fetch_base_reference(entry)
+    top10=build_google_top10(ref,gl,hl,location,max_products_per_entry)
+    return {"ean":entry.ean,"summary":summarize_entry(ref,top10),"top10":top10}
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# --- endpoints ---
 
 @app.get("/health")
-def health() -> Dict[str, Any]:
-    return {"ok": True, "timestamp": datetime.now(timezone.utc).isoformat()}
-
+def health():
+    return {"ok":True,"timestamp":datetime.now(timezone.utc).isoformat()}
 
 @app.post("/analyze")
-def analyze(
-    payload: AnalyzeRequest, x_app_token: Optional[str] = Header(default=None)
-) -> Dict[str, Any]:
-    if APP_TOKEN and x_app_token != APP_TOKEN:
-        raise HTTPException(status_code=401, detail="Token invalido.")
-
-    n = len(payload.entries)
-    max_workers = min(n, 5)
-
-    results: Dict[int, Dict[str, Any]] = {}
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_idx = {
-            executor.submit(
-                process_entry,
-                entry,
-                payload.gl,
-                payload.hl,
-                payload.location,
-                payload.max_products_per_entry,
-            ): idx
-            for idx, entry in enumerate(payload.entries)
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                results[idx] = future.result()
-            except ExternalAPIError as exc:
-                results[idx] = {
-                    "ean": payload.entries[idx].ean,
-                    "summary": {},
-                    "top10": [],
-                    "error": str(exc),
-                }
-            except Exception as exc:
-                logger.exception("Erro ao processar EAN %s", payload.entries[idx].ean)
-                results[idx] = {
-                    "ean": payload.entries[idx].ean,
-                    "summary": {},
-                    "top10": [],
-                    "error": f"erro interno: {exc}",
-                }
-
-    products = [results[i] for i in range(n)]
-
+def analyze(payload: AnalyzeRequest, x_app_token: Optional[str]=Header(default=None)):
+    if APP_TOKEN and x_app_token!=APP_TOKEN:
+        raise HTTPException(status_code=401,detail="Token invalido.")
+    n=len(payload.entries); results={}
+    with ThreadPoolExecutor(max_workers=min(n,5)) as ex:
+        fmap={ex.submit(process_entry,e,payload.gl,payload.hl,payload.location,payload.max_products_per_entry):i
+              for i,e in enumerate(payload.entries)}
+        for f in as_completed(fmap):
+            i=fmap[f]
+            try: results[i]=f.result()
+            except ExternalAPIError as e:
+                results[i]={"ean":payload.entries[i].ean,"summary":{},"top10":[],"error":str(e)}
+            except Exception as e:
+                logger.exception("Erro EAN %s",payload.entries[i].ean)
+                results[i]={"ean":payload.entries[i].ean,"summary":{},"top10":[],"error":f"erro interno: {e}"}
     return {
-        "meta": {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "location": payload.location,
-            "gl": payload.gl,
-            "hl": payload.hl,
-        },
-        "products": products,
+        "meta":{"generated_at":datetime.now(timezone.utc).isoformat(),"location":payload.location,"gl":payload.gl,"hl":payload.hl},
+        "products":[results[i] for i in range(n)],
     }
